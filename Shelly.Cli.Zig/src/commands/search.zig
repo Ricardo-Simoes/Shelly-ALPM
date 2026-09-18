@@ -709,10 +709,22 @@ fn renderAur(
     var index: usize = 0;
     while (index < result.packages.len and rows.items.len < display_count) : (index += 1) {
         const package = result.packages[index];
-        const hyper_path = std.mem.concat(context.allocator, u8, &.{ "/packages/", package.name, "/" }) catch continue;
+        var link_base: []const u8 = "";
+        var path_segment: []const u8 = "";
+        if (std.mem.indexOf(u8, result.aur_base, "atoll") != null) {
+            link_base = result.aur_base;
+            path_segment = "/package/";
+        } else if (std.mem.indexOf(u8, result.aur_base, "aur.archlinux") != null) {
+            link_base = result.aur_base;
+            path_segment = "/packages/";
+        } else {
+            link_base = aur_url.default_base;
+            path_segment = "/packages/";
+        }
+        const hyper_path = std.mem.concat(context.allocator, u8, &.{ path_segment, package.name, "/" }) catch continue;
         defer context.allocator.free(hyper_path);
-        const name_cell = if (result.aur_base.len > 0)
-            hyperlink(context.allocator, result.aur_base, hyper_path, package.name, context)
+        const name_cell = if (link_base.len > 0)
+            hyperlink(context.allocator, link_base, hyper_path, package.name, context)
         else
             package.name;
         try rows.append(context.allocator, try row(context.allocator, &.{
