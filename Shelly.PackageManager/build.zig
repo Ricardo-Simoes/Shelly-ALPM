@@ -862,6 +862,44 @@ pub fn build(b: *std.Build) void {
     const appimage_test_step = b.step("appimage-test", "Run safe AppImage parity tests");
     appimage_test_step.dependOn(&run_appimage_tests.step);
 
+    const repo_db_tests = b.addTest(.{
+        .name = "repo-db-test",
+        .root_module = mod,
+        .filters = &.{
+            "pkginfo parses keys and repeated values",
+            "pkginfo reads the PKGINFO entry from a package archive",
+            "pkginfo rejects archives without PKGINFO",
+            "package file list excludes archive root dotfiles and keeps nested dotfiles",
+            "package file list is byte-sorted and deduplicated",
+            "desc writes repo-add section order and omits empty sections",
+            "desc includes stat size streamed sha256 and PKGINFO isize",
+            "pgpsig is embedded only when requested",
+            "pgpsig rejects armored and oversized signatures",
+            "add creates db and files archives with a matching entry",
+            "add replacement keeps both databases in lockstep",
+            "add with new skips an existing identical entry without rewriting",
+            "add with prevent_downgrade skips only strictly newer existing versions",
+            "failed add leaves the database files unchanged",
+            "remove deletes entries by package name from both databases",
+            "remove of an unknown name fails without publishing",
+            "removing the last entry produces valid empty databases",
+            "publication keeps one old generation and refreshes the extension-less symlink",
+            "remove old files deletes package and signature only after publication",
+            "remove with remove old files deletes each matched package after publication",
+            "lock contention fails without modifying the database",
+            "database derives the files path and rejects unsupported extensions",
+            "publication signs each database archive and rotates the signature into place",
+            "a failed signature still publishes the database unsigned",
+            "a staged signature from an aborted run is not published",
+            "verify checks the signature of both database archives",
+            "verify reports a missing signature as skipped",
+            "verify stops at an unusable signature",
+        },
+    });
+    const run_repo_db_tests = b.addRunArtifact(repo_db_tests);
+    const repo_db_test_step = b.step("repo-db-test", "Run repository database tests");
+    repo_db_test_step.dependOn(&run_repo_db_tests.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means
