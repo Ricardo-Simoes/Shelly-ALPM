@@ -718,8 +718,7 @@ fn renderAur(
             link_base = result.aur_base;
             path_segment = "/packages/";
         } else {
-            link_base = aur_url.default_base;
-            path_segment = "/packages/";
+            package.name;
         }
         const hyper_path = std.mem.concat(context.allocator, u8, &.{ path_segment, package.name, "/" }) catch continue;
         defer context.allocator.free(hyper_path);
