@@ -4,7 +4,7 @@ msgstr ""
 "Report-Msgid-Bugs-To: csnyder@seafoam-labs.org\n"
 "POT-Creation-Date: 2026-09-19 13:14-0400\n"
 "PO-Revision-Date: 2026-06-17 11:40-0400\n"
-"Last-Translator: Ulaş Çakmak <celonfix@protonmail.com>\n"
+"Last-Translator: Mehmet Akif Öngün <mehmetakif.ongun@protonmail.com>\n"
 "Language-Team: Turkish (Turkiye)<>\n"
 "Language: tr\n"
 "MIME-Version: 1.0\n"
@@ -13,7 +13,7 @@ msgstr ""
 "X-Generator: Weblate 2026.7.dev0\n"
 
 msgid "No installable addons available"
-msgstr ""
+msgstr "Kurulabilir eklentiler mevcut değil"
 
 msgid "Close"
 msgstr "Kapat"
@@ -26,7 +26,7 @@ msgid ""
 "Those scripts are uploaded by users, and are not verified or vetted in any "
 "way. Only enable this feature if you are comfortable in verifying the build "
 "scripts."
-msgstr ""
+msgstr "Arch Kullanıcı Deposu PKGBUILD olarak bilinen derleme betikleri içerir"
 
 msgid ""
 "<a href=\"https://www.seafoam-labs.org/shelly-alpm/docs/aur-safety/\">AUR "
@@ -34,51 +34,51 @@ msgid ""
 msgstr ""
 
 msgid "Enable"
-msgstr ""
+msgstr "Etkinleştir"
 
 msgid "Cancel"
 msgstr "İptal"
 
 msgid "Keep configuration"
-msgstr ""
+msgstr "Yapılandırmayı sakla"
 
 msgid "App data and settings will be kept."
-msgstr ""
+msgstr "Uygulama verisi ve ayarları tutulacak."
 
 msgid "Remove configuration"
-msgstr ""
+msgstr "Yapılandırmayı sil"
 
 msgid "App data will be permanently removed."
-msgstr ""
+msgstr "Uygulama verisi kalıcı olarak silinecek"
 
 msgid "Confirm"
 msgstr "Onayla"
 
 msgid "Skip"
-msgstr ""
+msgstr "Atla"
 
 msgid "No special permissions requested"
-msgstr ""
+msgstr "Özel izin talep edilmedi"
 
 msgid "Review PKGBUILD changes"
 msgstr "PKGBUILD Değişikliklerini Gözden Geçir"
 
 msgid "Changes"
-msgstr ""
+msgstr "Değişiklikler"
 
 msgid "Warnings"
-msgstr ""
+msgstr "Uyarılar"
 
 msgid ""
 "These commands fetch and execute code outside of shelly and libalpm's "
 "control. Review them before continuing."
-msgstr ""
+msgstr "Buradaki komutlar shelly ve libalpm'in kodlarından bağımsız olarak kod çeker ve çalıştırlar. Devam etmeden önce kontrol ediniz."
 
 msgid "Source Files"
-msgstr ""
+msgstr "Kaynak Dosyaları"
 
 msgid "polkit is required"
-msgstr ""
+msgstr "polkit gereklidir."
 
 msgid ""
 "Shelly's GUI needs <b>polkit</b> installed and running to authorize "
@@ -89,9 +89,16 @@ msgid ""
 "<a href=\"https://www.seafoam-labs.org/shelly-alpm/docs/polkit/\">seafoam-"
 "labs.org/shelly-alpm/docs/polkit</a>"
 msgstr ""
+"Shelly grafik arayüzü ayrıcalıklı eylemleri yetkilendirmek için <b>polkit</b>'in "
+"kurulu ve çalışıyor olmasını gerektirir; ancak polkit sistem veri yolunda bulunamadı.\n"
+"\n"
+"Lütfen polykit'i kurup etkinleştirin, ardından tekrar deneyin.\n"
+"\n"
+"<a href=\"https://www.seafoam-labs.org/shelly-alpm/docs/polkit/\">seafoam-"
+"labs.org/shelly-alpm/docs/polkit</a>"
 
 msgid "Review PKGBUILD"
-msgstr ""
+msgstr "PKGBUILD'i gözden geçir"
 
 msgid "Search..."
 msgstr "Ara..."
