@@ -709,23 +709,16 @@ fn renderAur(
     var index: usize = 0;
     while (index < result.packages.len and rows.items.len < display_count) : (index += 1) {
         const package = result.packages[index];
-        var link_base: []const u8 = "";
-        var path_segment: []const u8 = "";
+        var name_cell: []const u8 = package.name;
         if (std.mem.indexOf(u8, result.aur_base, "atoll") != null) {
-            link_base = result.aur_base;
-            path_segment = "/package/";
+            const hyper_path = std.mem.concat(context.allocator, u8, &.{ "/package/", package.name, "/" }) catch continue;
+            defer context.allocator.free(hyper_path);
+            name_cell = hyperlink(context.allocator, result.aur_base, hyper_path, package.name, context);
         } else if (std.mem.indexOf(u8, result.aur_base, "aur.archlinux") != null) {
-            link_base = result.aur_base;
-            path_segment = "/packages/";
-        } else {
-            package.name;
+            const hyper_path = std.mem.concat(context.allocator, u8, &.{ "/packages/", package.name, "/" }) catch continue;
+            defer context.allocator.free(hyper_path);
+            name_cell = hyperlink(context.allocator, result.aur_base, hyper_path, package.name, context);
         }
-        const hyper_path = std.mem.concat(context.allocator, u8, &.{ path_segment, package.name, "/" }) catch continue;
-        defer context.allocator.free(hyper_path);
-        const name_cell = if (link_base.len > 0)
-            hyperlink(context.allocator, link_base, hyper_path, package.name, context)
-        else
-            package.name;
         try rows.append(context.allocator, try row(context.allocator, &.{
             name_cell,
             package.version,
@@ -1603,4 +1596,31 @@ test "package scoring matches the C# ranking tiers" {
     try std.testing.expectEqual(@as(u16, 200), packageScore("vesktop", "Discord client", "discord"));
     try std.testing.expectEqual(@as(u16, 150), packageScore("vesktop", "A custom discord client", "discord"));
     try std.testing.expectEqual(@as(u16, 100), packageScore("webcord", "A discordlike app", "discord"));
+}
+
+test "hyperlink builds correct OSC 8 links for atoll and aur" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environment = std.process.Environ.Map.init(allocator);
+    var stdout = std.Io.Writer.Discarding.init(&.{});
+    var stderr = std.Io.Writer.Discarding.init(&.{});
+    var context: runtime.RuntimeContext = .{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .stdout = &stdout.writer,
+        .stderr = &stderr.writer,
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+        .environment = &environment,
+    };
+
+    const atoll = hyperlink(allocator, "https://atoll.seafoam-labs.org", "/package/vim/", "vim", &context);
+    try std.testing.expect(std.mem.indexOf(u8, atoll, "\x1b]8;;https://atoll.seafoam-labs.org/package/vim/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, atoll, "\x1b\\vim\x1b]8;;\x1b\\") != null);
+
+    const aur = hyperlink(allocator, "https://aur.archlinux.org", "/packages/vim/", "vim", &context);
+    try std.testing.expect(std.mem.indexOf(u8, aur, "\x1b]8;;https://aur.archlinux.org/packages/vim/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aur, "\x1b\\vim\x1b]8;;\x1b\\") != null);
 }
