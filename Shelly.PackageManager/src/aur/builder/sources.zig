@@ -721,7 +721,7 @@ fn decompressStandaloneSource(
     decompressStandalonePayload(self, operation, source.destination, destination, compression) catch |err| {
         if (err == error.SourceDecompressionFailed or err == error.SourcePayloadTooLarge) {
             const reason: []const u8 = if (err == error.SourcePayloadTooLarge)
-                "The decompressed file exceeds the 4 GiB source size limit."
+                "Could not extract the source because its decompressed size exceeds the 4 GiB limit. Check that the selected source archive is correct."
             else
                 "The compressed file is damaged or incomplete. Download it again and retry the build.";
             const message = try std.fmt.allocPrint(self.allocator, "Could not decompress source \"{s}\". {s}", .{ source.source.name, reason });
@@ -786,7 +786,7 @@ fn extractSourceArchiveIfRecognized(
             next_entry = try reader.next();
             continue;
         }
-        const relative = try archive.normalizeEntryPath(self.allocator, entry.path);
+        const relative = try archive.normalizePosixEntryPath(self.allocator, entry.path);
         defer self.allocator.free(relative);
         const destination = try std.fs.path.join(self.allocator, &.{ destination_root, relative });
         defer self.allocator.free(destination);

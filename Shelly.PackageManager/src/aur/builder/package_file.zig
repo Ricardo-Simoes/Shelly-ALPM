@@ -106,8 +106,8 @@ fn tidyPackage(self: *PackageBuilder, package_build: *const PackageBuild, pkgdir
         if (result.exit_code != 0) {
             const warning = try std.fmt.allocPrint(
                 self.allocator,
-                "Could not strip {s} (exit {d}); keeping original file.\n{s}",
-                .{ entry.path, result.exit_code, std.mem.trimEnd(u8, result.stderr, "\r\n") },
+                "Could not strip {0f}; keeping the original file. Review the strip output in the build details.\n\nTechnical details: {1d}; {2f}",
+                .{ @import("diagnostics").safe(entry.path), result.exit_code, @import("diagnostics").safe(std.mem.trimEnd(u8, result.stderr, "\r\n")) },
             );
             defer self.allocator.free(warning);
             if (self.active_operation) |operation| {
@@ -182,6 +182,18 @@ pub fn assemblePackage(self: *PackageBuilder, package_build: *const PackageBuild
         &.{ self.options.work_directory, "pkg", package_name },
     );
     defer self.allocator.free(pkgdir);
+
+    if (self.virtual_ownership_tracker) |*tracker| {
+        if (try tracker.retainedDevicePath(self.io, pkgdir)) |path| {
+            defer self.allocator.free(path);
+            const message = try std.fmt.allocPrint(self.allocator, "Cannot package {f}: a temporary mknod placeholder remains. Device nodes in finished packages are unsupported; remove the temporary node in package().", .{@import("diagnostics").safe(path)});
+            defer self.allocator.free(message);
+            if (self.active_log) |log| try log.writeRecord("error", message);
+            if (self.active_operation) |operation|
+                operation.reportError(error.PrivilegedPackageOperationUnsupported, message, "build", null, false);
+            return error.PrivilegedPackageOperationUnsupported;
+        }
+    }
 
     // Resolve inode-attached ownership before tidy tools such as `strip` can
     // replace a file behind the same final package path.

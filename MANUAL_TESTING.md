@@ -280,6 +280,35 @@ Requires a kernel with Landlock enabled (check `cat /sys/kernel/security/lsm`).
   `[sandbox] extra_read` / `extra_write`
 - [ ] A failing sandboxed step leaves a `[sandbox]` hint line in its build log
 
+### Build Installation (`shelly build --install`)
+
+These install into the system package database; use a disposable package or
+machine.
+
+- [ ] `shelly build -s -l PKGBUILD` (or `shelly -Asl PKGBUILD`) synchronizes
+  build dependencies, builds, and then installs the packages, mirroring
+  `makepkg -si`
+- [ ] A split PKGBUILD whose members depend on each other installs every member
+  in one transaction, both through `shelly build --install` and through
+  `shelly install standard <archive>...`
+- [ ] `shelly build --install PKGBUILD` requests administrator credentials
+  before the build, builds unprivileged as the invoking user, and installs
+  from the elevated coordinator after the build
+- [ ] `shelly build -i --install PKGBUILD` installs the exported artifacts from
+  the root coordinator; the guest never attempts a host install
+- [ ] `shelly build -si PKGBUILD` is rejected as an unrecognized argument
+  (short options do not cluster); `-s -i` means sync plus isolated and `-s -l`
+  means sync plus install
+- [ ] `--install` with `--json`, `--ui-mode`, `--review-only`, or `--makesrcinfo`
+  exits `2` with "Cannot combine --install with ..." before building
+- [ ] In `shelly build -s --install`, a runtime dependency of the built package
+  that dependency synchronization installed survives the post-build cleanup;
+  the cleanup reports "Could not remove build dependencies" instead of
+  removing it
+- [ ] A forced install failure (for example a deliberate conflict) shows the
+  build output plus the install failure, exits non-zero, and does not report
+  "Could not build the requested package"
+
 ### Keyring Management
 
 - [ ] `shelly keyring init` initializes keyring
@@ -360,6 +389,18 @@ package first); for bash and zsh use a clean shell, and regenerate
 - [ ] Root/sudo operations work correctly
 - [ ] Permission errors are handled gracefully
 - [ ] User is prompted for elevation when needed
+- [ ] `zig build --build-file Shelly.Cli.Zig/build.zig isolated-build-test`
+  passes under umasks `0022`, `0007`, `0027`, and `0077`, preserving reviewed
+  file modes, guest traversal permissions, readable configuration, and the
+  private host operation boundary
+- [ ] From an authenticated normal-user sudo session,
+  `Shelly.Cli.Zig/scripts/test-isolated-build.sh` passes all four coordinator
+  umasks through real nspawn, checks UID/GID 1000 and guest configuration,
+  exports artifacts to the invoking user, and removes operation roots;
+  exit `77` means skipped, not passed
+- [ ] Build the pinned endcord PKGBUILD with `--isolated` using the rebuilt
+  CLI under coordinator umasks `0022` and `0077`; validate the exported
+  archives without installing them and record the recipe revision/source hash
 - [ ] `Shelly.Cli.Zig/scripts/test-elevation-cancellation.sh` passes without
   privileges for both SIGINT and SIGTERM
 - [ ] From a normal user session with a working elevator,

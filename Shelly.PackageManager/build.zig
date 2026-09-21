@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+    const diagnostics = b.dependency("shelly_diagnostics", .{ .target = target, .optimize = optimize }).module("diagnostics");
     const shelly_http = b.dependency("shelly_http", .{
         .target = target,
         .optimize = optimize,
@@ -48,18 +49,21 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    operation_context_mod.addImport("diagnostics", diagnostics);
     const user_account_mod = b.createModule(.{
         .root_source_file = b.path("src/shared/user_account.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    user_account_mod.addImport("diagnostics", diagnostics);
     const archive_mod = b.createModule(.{
         .root_source_file = b.path("src/shared/archive.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    archive_mod.addImport("diagnostics", diagnostics);
     archive_mod.linkSystemLibrary("archive", .{});
 
     // This creates a module, which represents a collection of source files alongside
@@ -83,6 +87,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    mod.addImport("diagnostics", diagnostics);
     mod.addImport("alpm_c", alpm_c);
     mod.addImport("archive", archive_mod);
     mod.addImport("operation_context", operation_context_mod);
@@ -160,6 +165,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.root_module.addImport("diagnostics", diagnostics);
 
     const zig_time_dep = b.dependency("zig-time", .{});
     exe.root_module.addImport("zig-time", zig_time_dep.module("zig-time"));
@@ -206,8 +212,10 @@ pub fn build(b: *std.Build) void {
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
+    const test_filters = b.option([]const []const u8, "test-filter", "Run root tests whose names contain this text") orelse &.{};
     const mod_tests = b.addTest(.{
         .root_module = mod,
+        .filters = test_filters,
     });
 
     // A run step that will run the test executable.
@@ -218,6 +226,7 @@ pub fn build(b: *std.Build) void {
     // hence why we have to create two separate ones.
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .filters = test_filters,
     });
 
     // A run step that will run the second test executable.
@@ -229,6 +238,37 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    const bootstrap_tests = b.addTest(.{
+        .root_module = mod,
+        .filters = &.{ "bootstrap", "provisioning", "root finalizer" },
+    });
+    const bootstrap_step = b.step("bootstrap-test", "Test isolated root configuration and diagnostics");
+    bootstrap_step.dependOn(&b.addRunArtifact(bootstrap_tests).step);
+
+    const hook_helper = b.addExecutable(.{
+        .name = "bootstrap-hook-helper",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/alpm/bootstrap_hook_helper.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const hook_fixture = b.addOptions();
+    hook_fixture.addOptionPath("helper", hook_helper.getEmittedBin());
+    const hook_test_module = b.createModule(.{
+        .root_source_file = b.path("src/alpm/bootstrap_hook_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    hook_test_module.addImport("Zigalpm", mod);
+    hook_test_module.addOptions("hook_fixture", hook_fixture);
+    const hook_tests = b.addTest(.{ .root_module = hook_test_module });
+    const run_hook_tests = b.addSystemCommand(&.{ "unshare", "--user", "--map-root-user", "--mount", "--pid", "--fork" });
+    run_hook_tests.addArtifactArg(hook_tests);
+    run_hook_tests.has_side_effects = true;
+    const hook_step = b.step("bootstrap-hook-test", "Test real guest hooks in a disposable user namespace (no host root)");
+    hook_step.dependOn(&run_hook_tests.step);
 
     const account_tests = b.addTest(.{
         .name = "user-account-test",
@@ -258,6 +298,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    shellybuild_test_module.addImport("diagnostics", diagnostics);
     shellybuild_test_module.addImport("toml", toml.module("toml"));
     shellybuild_test_module.addImport("operation_context", operation_context_mod);
     shellybuild_test_module.addImport("user_account", user_account_mod);
@@ -281,6 +322,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    local_test_module.addImport("diagnostics", diagnostics);
     local_test_module.addImport("archive", archive_mod);
     local_test_module.addImport("operation_context", operation_context_mod);
     const local_tests = b.addTest(.{ .root_module = local_test_module });
@@ -375,6 +417,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    downloader_test_module.addImport("diagnostics", diagnostics);
     downloader_test_module.addImport("operation_context", operation_context_mod);
     downloader_test_module.addImport("ShellyHttp", shelly_http.module("ShellyHttp"));
     const downloader_tests = b.addTest(.{ .name = "downloader-test", .root_module = downloader_test_module });
@@ -401,6 +444,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    cache_test_module.addImport("diagnostics", diagnostics);
     cache_test_module.addImport("alpm_c", alpm_c);
     cache_test_module.addImport("operation_context", operation_context_mod);
     const cache_tests = b.addTest(.{ .name = "cache-test", .root_module = cache_test_module });
@@ -467,6 +511,7 @@ pub fn build(b: *std.Build) void {
             "remove_repository is a no-op for unknown repositories",
             "Manager hold APIs mutate HoldPkg while retaining shelly",
             "dependency query APIs resolve exact, versioned, and virtual remote packages",
+            "dependency query misses do not emit failures but real errors and cancellation survive",
             "install_packages predownloads prepared repository packages before commit",
             "install_packages exposes its prepared plan and decline prevents downloads",
             "install_packages needed",
@@ -571,6 +616,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    fake_backend_module.addImport("diagnostics", diagnostics);
     fake_backend_module.addImport(
         "Shelly_Flatpak_Protocol",
         flatpak_backend_dep.module("Shelly_Flatpak_Protocol"),
@@ -580,6 +626,7 @@ pub fn build(b: *std.Build) void {
         .linkage = .dynamic,
         .root_module = fake_backend_module,
     });
+    fake_backend.root_module.addImport("diagnostics", diagnostics);
     const fake_backend_filename =
         "libshelly-flatpak-backend-package-manager-test.so";
     const install_fake_backend = b.addInstallArtifact(fake_backend, .{
@@ -605,6 +652,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    backend_integration_module.addImport("diagnostics", diagnostics);
     backend_integration_module.addImport(
         "Shelly_Flatpak_Protocol",
         flatpak_backend_dep.module("Shelly_Flatpak_Protocol"),
@@ -703,9 +751,14 @@ pub fn build(b: *std.Build) void {
             "PackageBuilder rejects an explicitly selected disabled dynamic member",
             "PackageBuilder requires supplemental review for a dynamically discovered local source",
             "PackageBuilder rejects a legacy unwritable package tree",
-            "PackageBuilder cannot perform privileged package filesystem operations",
+            "PackageBuilder rejects retained temporary device nodes",
+            "PackageBuilder external helpers preserve ownership and temporary devices",
+            "PackageBuilder parallel external helpers serialize metadata",
+            "PackageBuilder rejects unsafe external device operations",
             "PackageBuilder simulates root ownership without host chown",
             "PackageBuilder preserves non-root virtual ownership and special modes",
+            "PackageBuilder install option clusters preserve virtual ownership",
+            "PackageBuilder install rejects unsupported and malformed ownership options",
             "PackageBuilder virtual ownership follows identities and recursive snapshots",
             "virtual ownership identities distinguish reused inode numbers",
             "PackageBuilder isolates virtual ownership between split members",
@@ -741,6 +794,8 @@ pub fn build(b: *std.Build) void {
             "PackageBuilder extracts source archives into srcdir",
             "PackageBuilder standalone",
             "PackageBuilder detects source archives by content including zip and tar zstd",
+            "PackageBuilder preserves literal backslashes in GStreamer source archive filenames",
+            "PackageBuilder rejects source archive traversal even alongside literal backslashes",
             "PackageBuilder extracts an extensionless source over its matching archive root",
             "PackageBuilder rejects an archive root colliding with another staged source",
             "PackageBuilder preserves source archive modification timestamps",
