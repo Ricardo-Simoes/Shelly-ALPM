@@ -709,7 +709,7 @@ msgstr "Paket Önbelleğini Temizle"
 msgid ""
 "Removes old cached package versions, keeping the selected number per package."
 msgstr ""
-"Her paket için seçilmiş sayıda sürümü tutara eski önbellek sürümlerini kaldırır."
+"Her paket için seçilmiş sayıda sürümü tutarak eski önbellek sürümlerini kaldırır."
 
 msgid "Keep"
 msgstr "Tut"
