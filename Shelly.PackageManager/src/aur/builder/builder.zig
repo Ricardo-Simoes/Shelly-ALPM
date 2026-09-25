@@ -229,6 +229,18 @@ pub const PackageBuilder = struct {
         defer self.allocator.free(path);
         var environment = try self.environ.createMap(self.allocator);
         defer environment.deinit();
+        for (self.shellybuild_config.build.env) |assignment| {
+            const config = @import("../shellybuild.zig");
+            config.validateEnvironmentAssignment(assignment) catch |err| {
+                const message = try std.fmt.allocPrint(self.allocator, "Invalid build.env variable '{f}': {s}.", .{
+                    @import("diagnostics").safe(assignment.name), config.environmentErrorReason(err),
+                });
+                defer self.allocator.free(message);
+                operation.reportError(err, message, "build configuration", null, false);
+                return err;
+            };
+            try environment.put(assignment.name, assignment.value);
+        }
         try environment.put("PATH", path);
         const owned: std.process.Environ = .{ .block = try environment.createPosixBlock(self.allocator, .{}) };
         self.owned_environ = owned;
