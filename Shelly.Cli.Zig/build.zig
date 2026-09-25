@@ -97,12 +97,19 @@ pub fn build(b: *std.Build) void {
         .root_module = builder_test_module,
         .filters = &.{
             "makesrcinfo emits clean stdout and never runs lifecycle functions",
+            "review-only accepts Heroic array trimming",
+            "review-only accepts filesystem here-strings",
             "sync deps",
             "isolated source key",
             "isolated source public keys",
             "isolated child arguments",
             "isolated dependency review",
             "isolated configuration preserves build policy",
+            "invoking user build arguments",
+            "build install options parse",
+            "build install rejects output modes",
+            "artifact report",
+            "host coordinator",
         },
     });
     const run_builder_tests = b.addRunArtifact(builder_tests);
