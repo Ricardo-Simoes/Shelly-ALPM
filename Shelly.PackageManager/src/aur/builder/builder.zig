@@ -38,6 +38,7 @@ test {
     _ = @import("steps.zig");
     _ = @import("sources.zig");
     _ = @import("package_file.zig");
+    _ = @import("package_permissions.zig");
     _ = @import("virtual_ownership.zig");
 }
 
@@ -319,6 +320,7 @@ pub const PackageBuilder = struct {
         if (self.active_operation != null) return error.BuildAlreadyRunning;
         self.active_operation = operation;
         defer self.active_operation = null;
+        self.failure_location = .{};
         try self.resolveSourceDateEpoch();
         try steps.validateBuildDirectories(self);
         var log = try steps.openBuildLog(self);
@@ -327,6 +329,16 @@ pub const PackageBuilder = struct {
         defer self.active_log = null;
         try log.writeRecord("build", "started");
         const artifacts = self.buildPackage(operation) catch |err| {
+            const location = self.failure_location;
+            const detail = std.fmt.allocPrint(self.allocator, "{s}: {s}: {s}", .{
+                location.package_name orelse self.requested_names[0],
+                location.step_name orelse "build",
+                @errorName(err),
+            }) catch null;
+            if (detail) |message| {
+                defer self.allocator.free(message);
+                log.writeRecord("error", message) catch {};
+            }
             log.writeRecord("status", if (err == error.Cancelled) "cancelled" else "failed") catch {};
             return err;
         };
@@ -593,7 +605,11 @@ pub const PackageBuilder = struct {
             for ([_][]const u8{ "src", "pkg" }) |name| {
                 const path = try std.fs.path.join(self.allocator, &.{ self.options.work_directory, name });
                 defer self.allocator.free(path);
-                std.Io.Dir.cwd().deleteTree(self.io, path) catch |err| {
+                const cleanup = if (std.mem.eql(u8, name, "pkg"))
+                    package_file.cleanPackageTree(self)
+                else
+                    std.Io.Dir.cwd().deleteTree(self.io, path);
+                cleanup catch |err| {
                     const message = try std.fmt.allocPrint(self.allocator, "The build completed, but Shelly could not remove the temporary files in \"{s}\". You can remove them when they are no longer needed.", .{path});
                     defer self.allocator.free(message);
                     operation.reportError(err, message, "build", null, true);

@@ -1470,6 +1470,211 @@ test "PackageBuilder rejects a legacy unwritable package tree" {
     try testing.expectError(error.BuildDirectoryNotWritable, fixture.builder.BuildPackage());
 }
 
+// These fixtures must run as an ordinary user: root would hide missing access.
+test "PackageBuilder packages restrictive directories with original archive and MTREE modes" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const io = testing.io;
+    for ([_][]const u8{ "", "options=('!purge' '!strip')" }) |options| {
+        const content = try std.fmt.allocPrint(allocator,
+            \\pkgname=restricted
+            \\pkgver=1
+            \\pkgrel=1
+            \\arch=('any')
+            \\{s}
+            \\package() {{
+            \\  /bin/sh -c 'install -d -m 0111 "$1/var/lib/snapd/void"' sh "$pkgdir"
+            \\  mkdir -p "$pkgdir/locked/nested"
+            \\  printf 'payload\n' > "$pkgdir/locked/nested/data"
+            \\  ln -s "$startdir/external" "$pkgdir/locked/external-link"
+            \\  chown 42:84 "$pkgdir/locked/nested"
+            \\  chmod 0000 "$pkgdir/locked/nested"
+            \\  chmod 01111 "$pkgdir/locked"
+            \\}}
+        , .{options});
+        defer allocator.free(content);
+        var fixture = try Fixture.create(allocator, content, null, null);
+        defer fixture.destroy();
+        defer @import("package_permissions.zig").removeTree(allocator, io, fixture.temporary.dir, "pkg") catch {};
+        try fixture.temporary.dir.createDir(io, "external", .fromMode(0o700));
+        try fixture.temporary.dir.writeFile(io, .{ .sub_path = "external/keep", .data = "outside" });
+        try fixture.temporary.dir.setFilePermissions(io, "external", .fromMode(0o111), .{});
+        defer fixture.temporary.dir.setFilePermissions(io, "external", .fromMode(0o700), .{}) catch {};
+
+        // A second successful build must clean the restored restricted tree.
+        for (0..2) |_| {
+            const artifacts = try fixture.builder.run();
+            defer builder_mod.deinitArtifacts(allocator, artifacts);
+            const expected = [_]struct { path: []const u8, mode: u32, uid: i64 = 0, gid: i64 = 0 }{
+                .{ .path = "var/lib/snapd/void", .mode = 0o111 },
+                .{ .path = "locked", .mode = 0o1111 },
+                .{ .path = "locked/nested", .mode = 0, .uid = 42, .gid = 84 },
+            };
+            var reader = try archive.Reader.init(allocator, artifacts[0].path);
+            defer reader.deinit();
+            var found: usize = 0;
+            var saw_external_link = false;
+            while (try reader.next()) |entry| {
+                if (std.mem.eql(u8, entry.path, "locked/external-link")) {
+                    try testing.expectEqual(archive.EntryKind.symbolic_link, entry.kind);
+                    saw_external_link = true;
+                }
+                for (expected) |item| {
+                    if (!std.mem.eql(u8, std.mem.trimEnd(u8, entry.path, "/"), item.path)) continue;
+                    found += 1;
+                    try testing.expectEqual(item.mode, entry.permissions);
+                    try testing.expectEqual(item.uid, entry.uid);
+                    try testing.expectEqual(item.gid, entry.gid);
+                    const staged_path = try std.fs.path.join(allocator, &.{ "pkg/restricted", item.path });
+                    defer allocator.free(staged_path);
+                    const stat = try fixture.temporary.dir.statFile(io, staged_path, .{});
+                    try testing.expectEqual(item.mode, stat.permissions.toMode() & 0o7777);
+                }
+            }
+            try testing.expectEqual(expected.len, found);
+            try testing.expect(saw_external_link);
+            const external = try fixture.temporary.dir.statFile(io, "external", .{});
+            try testing.expectEqual(@as(u32, 0o111), external.permissions.toMode() & 0o7777);
+            const outside = try fixture.temporary.dir.readFileAlloc(io, "external/keep", allocator, .unlimited);
+            defer allocator.free(outside);
+            try testing.expectEqualStrings("outside", outside);
+            const data = try readPackageEntry(allocator, artifacts[0].path, "locked/nested/data");
+            defer allocator.free(data);
+            try testing.expectEqualStrings("payload\n", data);
+            const info = try readPkgInfo(allocator, artifacts[0].path);
+            defer allocator.free(info);
+            try testing.expect(std.mem.indexOf(u8, info, "\nsize = 8\n") != null);
+
+            const mtree_path = try std.fs.path.join(allocator, &.{ fixture.build_dir, "pkg/restricted/.MTREE" });
+            defer allocator.free(mtree_path);
+            var gzip = try process_runner.run(allocator, io, &.{ "gzip", "-dc", mtree_path }, null, null);
+            defer gzip.deinit(allocator);
+            try testing.expectEqual(@as(u8, 0), gzip.exit_code);
+            for (expected) |item| {
+                const prefix = try std.fmt.allocPrint(allocator, "./{s} ", .{item.path});
+                defer allocator.free(prefix);
+                var lines = std.mem.splitScalar(u8, gzip.stdout, '\n');
+                var saw_mode = false;
+                while (lines.next()) |line| {
+                    if (!std.mem.startsWith(u8, line, prefix)) continue;
+                    var fields = std.mem.tokenizeScalar(u8, line, ' ');
+                    while (fields.next()) |field| {
+                        if (!std.mem.startsWith(u8, field, "mode=")) continue;
+                        try testing.expectEqual(item.mode, try std.fmt.parseInt(u32, field[5..], 8));
+                        saw_mode = true;
+                    }
+                }
+                try testing.expect(saw_mode);
+            }
+        }
+    }
+}
+
+test "PackageBuilder retries a failed package step with restricted leftovers and logs the cause" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var fixture = try Fixture.create(allocator,
+        \\pkgname=retry-restricted
+        \\pkgver=1
+        \\pkgrel=1
+        \\arch=('any')
+        \\package() {
+        \\  mkdir -p "$pkgdir/locked/child"
+        \\  echo payload > "$pkgdir/locked/child/file"
+        \\  chmod 0000 "$pkgdir/locked/child" "$pkgdir/locked"
+        \\  if [ ! -f "$startdir/first-attempt" ]; then
+        \\    touch "$startdir/first-attempt"
+        \\    return 1
+        \\  fi
+        \\}
+    , null, null);
+    defer fixture.destroy();
+    defer @import("package_permissions.zig").removeTree(allocator, io, fixture.temporary.dir, "pkg") catch {};
+    try testing.expectError(error.StepFailed, fixture.builder.run());
+    const log = try readOnlyBuildLog(allocator, io, fixture.build_dir);
+    defer allocator.free(log);
+    try testing.expect(std.mem.indexOf(u8, log, "retry-restricted: package: StepFailed") != null);
+    fixture.builder.options.clean_after_success = true;
+    const artifacts = try fixture.builder.run();
+    defer builder_mod.deinitArtifacts(allocator, artifacts);
+    const data = try readPackageEntry(allocator, artifacts[0].path, "locked/child/file");
+    defer allocator.free(data);
+    try testing.expectEqualStrings("payload\n", data);
+    try testing.expectError(error.FileNotFound, fixture.temporary.dir.access(io, "pkg", .{}));
+}
+
+test "PackageBuilder restores restrictive permissions after assembly failure and retries" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var fixture = try Fixture.create(allocator,
+        \\pkgname=restricted-failure
+        \\pkgver=1
+        \\pkgrel=1
+        \\arch=('any')
+        \\package() {
+        \\  mkdir -p "$pkgdir/locked"
+        \\  chmod 0000 "$pkgdir/locked"
+        \\}
+    , null, null);
+    defer fixture.destroy();
+    defer @import("package_permissions.zig").removeTree(allocator, io, fixture.temporary.dir, "pkg") catch {};
+    const output_name = "restricted-failure-1-1-any.pkg.tar.zst";
+    try fixture.temporary.dir.writeFile(io, .{ .sub_path = output_name, .data = "existing" });
+    fixture.builder.options.overwrite = false;
+    try testing.expectError(error.AlreadyBuilt, fixture.builder.run());
+    const stat = try fixture.temporary.dir.statFile(io, "pkg/restricted-failure/locked", .{});
+    try testing.expectEqual(@as(u32, 0), stat.permissions.toMode() & 0o7777);
+    const log = try readOnlyBuildLog(allocator, io, fixture.build_dir);
+    defer allocator.free(log);
+    try testing.expect(std.mem.indexOf(u8, log, "restricted-failure: package-assembly: AlreadyBuilt") != null);
+    const existing = try fixture.temporary.dir.readFileAlloc(io, output_name, allocator, .unlimited);
+    defer allocator.free(existing);
+    try testing.expectEqualStrings("existing", existing);
+    fixture.builder.options.overwrite = true;
+    const artifacts = try fixture.builder.run();
+    defer builder_mod.deinitArtifacts(allocator, artifacts);
+    try testing.expectEqual(@as(usize, 1), artifacts.len);
+}
+
+test "PackageBuilder restrictive directory modes are isolated between split packages" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var fixture = try Fixture.createMany(allocator,
+        \\pkgbase=restricted-split
+        \\pkgname=('restricted-a' 'restricted-b')
+        \\pkgver=1
+        \\pkgrel=1
+        \\arch=('any')
+        \\package_restricted-a() {
+        \\  install -d -m 0111 "$pkgdir/same"
+        \\  chmod 0000 "$pkgdir"
+        \\}
+        \\package_restricted-b() {
+        \\  install -d -m 0755 "$pkgdir/same"
+        \\}
+    , &.{ "restricted-a", "restricted-b" }, null);
+    defer fixture.destroy();
+    defer @import("package_permissions.zig").removeTree(allocator, testing.io, fixture.temporary.dir, "pkg") catch {};
+    const artifacts = try fixture.builder.run();
+    defer builder_mod.deinitArtifacts(allocator, artifacts);
+    try testing.expectEqual(@as(usize, 2), artifacts.len);
+    for (artifacts, [_]u32{ 0o111, 0o755 }) |artifact, mode| {
+        var reader = try archive.Reader.init(allocator, artifact.path);
+        defer reader.deinit();
+        var found = false;
+        while (try reader.next()) |entry| {
+            if (!std.mem.eql(u8, std.mem.trimEnd(u8, entry.path, "/"), "same")) continue;
+            found = true;
+            try testing.expectEqual(mode, entry.permissions);
+        }
+        try testing.expect(found);
+    }
+    const root = try fixture.temporary.dir.statFile(testing.io, "pkg/restricted-a", .{});
+    try testing.expectEqual(@as(u32, 0), root.permissions.toMode() & 0o7777);
+}
+
 test "PackageBuilder rejects retained temporary device nodes" {
     const allocator = testing.allocator;
     var fixture = try Fixture.create(allocator,
