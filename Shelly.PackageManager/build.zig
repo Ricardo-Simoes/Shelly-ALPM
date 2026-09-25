@@ -681,6 +681,7 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
         .filters = &.{
             "AUR dispatcher forwards package stages and build progress",
+            "AUR needed",
             "AUR dispatcher returns provider selections",
             "AUR handlers can be removed through the manager-facing dispatcher",
             "AUR RPC URL and form encoding matches the C# requests",
