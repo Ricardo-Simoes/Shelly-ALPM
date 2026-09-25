@@ -38,6 +38,8 @@ const pathIsInside = review_integrity.pathIsInside;
 const reviewDigest = review_integrity.reviewDigest;
 
 pub const InitOptions = struct {
+    /// Skip equal-version target builds and archive reinstalls during installation.
+    needed: bool = false,
     config_path: ?[]const u8 = null,
     root: bool = false,
     use_temp_path: bool = false,
@@ -232,6 +234,7 @@ pub const Manager = struct {
     vcs_store_path: []u8,
     chroot_path: []u8,
     use_chroot: bool,
+    needed: bool = false,
     no_check: bool,
     sign: bool,
     sign_key: ?[]const u8,
@@ -315,6 +318,7 @@ pub const Manager = struct {
             .vcs_store_path = vcs_store_path,
             .chroot_path = chroot_path,
             .use_chroot = options.use_chroot,
+            .needed = options.needed,
             .no_check = !(options.check orelse if (options.use_chroot or options.makepkg_command != null)
                 false
             else
@@ -1112,7 +1116,7 @@ pub const Manager = struct {
             self.raisePackageProgress(.aur_install_start, package_name, current, plans.items.len, "");
             const install_paths = try artifactPaths(self.allocator, artifacts);
             defer self.allocator.free(install_paths);
-            try self.alpm.install_local_packages(install_paths, .{});
+            try self.alpm.install_local_packages(install_paths, .{ .needed = self.needed });
             self.raisePackageProgress(.aur_install_done, package_name, current, plans.items.len, "");
             for (requested_names) |requested_name|
                 self.updateVcsStoreForPackage(requested_name, prepared.pkgbuild_path) catch |err|
@@ -1146,6 +1150,12 @@ pub const Manager = struct {
         index = 0;
         while (index < plans.items.len) {
             const plan = &plans.items[index];
+            try self.filterNeededTargets(plan);
+            if (plan.requested_names.items.len == 0) {
+                var removed = plans.orderedRemove(index);
+                removed.deinit(self.allocator);
+                continue;
+            }
             self.preparePlanDependencies(plan) catch |err| {
                 try self.skipDeclinedPlan(plan, err);
                 var removed = plans.orderedRemove(index);
@@ -1178,6 +1188,44 @@ pub const Manager = struct {
             dependencyOptionalValues(&plan.prepared),
         );
         try self.checkCancelled();
+    }
+
+    fn filterNeededTargets(self: *Self, plan: *PreparedInstall) !void {
+        if (!self.needed or !canSkipNeededBuild(&plan.prepared)) return;
+        const generated = try self.generateReviewedSrcinfo(&plan.prepared);
+        defer self.allocator.free(generated);
+        var index: usize = 0;
+        while (index < plan.requested_names.items.len) {
+            const name = plan.requested_names.items[index];
+            if (!isVcsPackage(name) and try self.skipCurrentTarget(name, generated)) {
+                self.allocator.free(plan.requested_names.orderedRemove(index));
+            } else index += 1;
+        }
+        // Reuse the evaluated metadata, selecting only members still requested.
+        if (plan.requested_names.items.len > 0) {
+            plan.prepared.dependency_metadata = try srcinfo.parseDependencyMetadata(
+                self.allocator,
+                self.io(),
+                generated,
+                plan.requested_names.items,
+                self.shellybuild_config.build.carch,
+            );
+        }
+    }
+
+    fn skipCurrentTarget(self: *Self, name: []const u8, generated: []const u8) !bool {
+        try self.checkCancelled();
+        const candidate = try srcinfo.packageVersion(self.allocator, generated, name) orelse return false;
+        defer self.allocator.free(candidate);
+        const terminated_name = try self.allocator.dupeZ(u8, name);
+        defer self.allocator.free(terminated_name);
+        const installed = try self.alpm.get_single_installed_package(terminated_name) orelse return false;
+        const installed_version = installed.version() orelse return false;
+        if (AlpmManager.compare_package_versions(installed_version, candidate) != 0) return false;
+        const message = try std.fmt.allocPrint(self.allocator, "Skipped {s}: {s} is already installed (--needed).", .{ name, candidate });
+        defer self.allocator.free(message);
+        self.raiseInfo(.informational_output, name, message, null, null);
+        return true;
     }
 
     fn skipDeclinedPlan(self: *Self, plan: *const PreparedInstall, err: anyerror) !void {
@@ -1390,8 +1438,14 @@ pub const Manager = struct {
         var prepared = try self.prepareRequiredPackageForBuild(package_name, commit);
         defer prepared.deinit(self.allocator);
         self.raisePackageProgress(.aur_download_done, package_name, 1, 1, "");
-        try self.alpm.sync(false);
+        if (!self.needed) try self.alpm.sync(false);
         try self.requirePkgbuildApproval(&prepared);
+        if (self.needed and canSkipNeededBuild(&prepared)) {
+            const generated = try self.generateReviewedSrcinfo(&prepared);
+            defer self.allocator.free(generated);
+            if (try self.skipCurrentTarget(package_name, generated)) return;
+        }
+        if (self.needed) try self.alpm.sync(false);
         try self.resolvePreparedDependencies(&prepared, &.{package_name});
         var dependency_info = dependencyPlanningInfo(&prepared);
         const build_only = try dependency_resolver.collectBuildOnlyDependencies(self.allocator, &dependency_info, self.no_check, self.dependencyBackend());
@@ -1425,7 +1479,7 @@ pub const Manager = struct {
         self.raisePackageProgress(.aur_install_start, package_name, 1, 1, "");
         const install_paths = try artifactPaths(self.allocator, artifacts);
         defer self.allocator.free(install_paths);
-        try self.alpm.install_local_packages(install_paths, .{});
+        try self.alpm.install_local_packages(install_paths, .{ .needed = self.needed });
         self.raisePackageProgress(.aur_install_done, package_name, 1, 1, "");
         self.removeBuildOnlyDependencies(package_name, @ptrCast(build_only), 1, 1);
         self.raisePackageProgress(.aur_package_completed, package_name, 1, 1, "");
@@ -1544,7 +1598,7 @@ pub const Manager = struct {
         self.raisePackageProgress(.aur_install_start, dependency.package_name, 1, 1, "Installing AUR dependency");
         const install_paths = try artifactPaths(self.allocator, artifacts);
         defer self.allocator.free(install_paths);
-        try self.alpm.install_local_packages(install_paths, .{ .alldeps = true });
+        try self.alpm.install_local_packages(install_paths, .{ .alldeps = true, .needed = self.needed });
         self.raisePackageProgress(.aur_install_done, dependency.package_name, 1, 1, "");
         self.raisePackageProgress(.aur_package_completed, dependency.package_name, 1, 1, "");
     }
@@ -3502,6 +3556,24 @@ fn parseAurGitRemote(allocator: std.mem.Allocator, base: []const u8, remote: []c
     return @as(?[]u8, try allocator.dupe(u8, remainder));
 }
 
+fn canSkipNeededBuild(prepared: *const PreparedPackage) bool {
+    // pkgver() runs after source preparation. Neither RPC nor generated
+    // SRCINFO can establish its eventual version before that work occurs.
+    if (isVcsPackage(prepared.package_name) or prepared.info.dynamic_assignments.len > 0 or
+        prepared.info.dynamic_source_assignments.len > 0) return false;
+    if (prepared.info.execution) |execution| {
+        for (execution.steps) |step| if (std.mem.eql(u8, step.name, "pkgver")) return false;
+    }
+    for (prepared.info.source orelse &.{}) |raw_source| {
+        const source = if (std.mem.indexOf(u8, raw_source, "::")) |separator| raw_source[separator + 2 ..] else raw_source;
+        for ([_][]const u8{ "git", "svn", "hg", "bzr", "darcs", "cvs" }) |protocol| {
+            if (std.mem.startsWith(u8, source, protocol) and source.len > protocol.len and
+                (source[protocol.len] == '+' or source[protocol.len] == ':')) return false;
+        }
+    }
+    return true;
+}
+
 fn isVcsPackage(package_name: []const u8) bool {
     for ([_][]const u8{ "-git", "-svn", "-hg", "-bzr", "-darcs", "-cvs" }) |suffix|
         if (endsWithIgnoreCase(package_name, suffix)) return true;
@@ -5049,6 +5121,208 @@ test "all requested PKGBUILDs are reviewed before the first build" {
         manager.updatePackages(&.{"missing-review-fixture"}),
     );
     try std.testing.expectEqual(@as(usize, 1), failure_capture.count);
+}
+
+fn seedNeededInstalledPackage(allocator: std.mem.Allocator, io: std.Io, root: []const u8, name: []const u8, installed_version: []const u8) !void {
+    const directory = try std.fmt.allocPrint(allocator, "{s}/db/local/{s}-{s}", .{ root, name, installed_version });
+    defer allocator.free(directory);
+    try std.Io.Dir.cwd().createDirPath(io, directory);
+    const db_version_path = try std.fs.path.join(allocator, &.{ root, "db", "local", "ALPM_DB_VERSION" });
+    defer allocator.free(db_version_path);
+    try writeFixtureFile(io, db_version_path, "9\n", false);
+    const path = try std.fs.path.join(allocator, &.{ directory, "desc" });
+    defer allocator.free(path);
+    const desc = try std.fmt.allocPrint(allocator, "%NAME%\n{s}\n\n%VERSION%\n{s}\n\n%ARCH%\nany\n\n%REASON%\n0\n\n%VALIDATION%\nnone\n\n", .{ name, installed_version });
+    defer allocator.free(desc);
+    try writeFixtureFile(io, path, desc, false);
+}
+
+test "AUR needed skips equal versions before builds and preserves other installation modes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cases = [_]struct {
+        label: []const u8,
+        installed: ?[]const u8 = "1-1",
+        extra: []const u8 = "",
+        name: []const u8 = "needed-demo",
+        needed: bool = true,
+        skip: bool = false,
+        exact: bool = false,
+        dependencies_only: bool = false,
+        archive: bool = false,
+    }{
+        .{ .label = "equal", .skip = true },
+        .{ .label = "missing", .installed = null },
+        .{ .label = "upgrade", .installed = "0-1" },
+        .{ .label = "downgrade", .installed = "2-1" },
+        .{ .label = "release", .installed = "1-2" },
+        .{ .label = "epoch", .installed = "1:1-1" },
+        .{ .label = "equivalent", .installed = "0:1-1", .skip = true },
+        .{ .label = "default", .needed = false },
+        .{ .label = "vcs", .name = "needed-demo-git" },
+        .{ .label = "pkgver", .extra = "pkgver() { echo 1; }\n" },
+        .{ .label = "dynamic", .extra = "pkgver=$(printf 1)\n" },
+        .{ .label = "dynamic-archive", .extra = "pkgver() { echo 1; }\n", .archive = true },
+        .{ .label = "exact-dynamic-archive", .extra = "pkgver() { echo 1; }\n", .archive = true, .exact = true },
+        .{ .label = "exact-equal", .exact = true, .skip = true },
+        .{ .label = "exact-different", .exact = true, .installed = "2-1" },
+        .{ .label = "skip-dependencies", .extra = "depends=('needed-dep')\n", .skip = true },
+        .{ .label = "dependencies-only", .extra = "depends=('needed-dep')\n", .dependencies_only = true },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("AUR needed case: {s}\n", .{case.label});
+        var fixture = try createAurManagerFixturePaths(allocator, io);
+        defer fixture.deinit(allocator);
+        if (case.installed) |installed| try seedNeededInstalledPackage(allocator, io, fixture.root, case.name, installed);
+        try createAurFixtureRepository(allocator, io, fixture.remote_root, case.name, null);
+        try createAurFixtureRepository(allocator, io, fixture.remote_root, "needed-dep", null);
+        const remote = try std.fmt.allocPrint(allocator, "{s}/{s}.git", .{ fixture.remote_root, case.name });
+        defer allocator.free(remote);
+        const pkgbuild_path = try std.fs.path.join(allocator, &.{ remote, "PKGBUILD" });
+        defer allocator.free(pkgbuild_path);
+        const content = try std.fmt.allocPrint(allocator, "pkgname={s}\npkgver=1\npkgrel=1\narch=('any')\n{s}package() {{ :; }}\n", .{ case.name, case.extra });
+        defer allocator.free(content);
+        try writeFixtureFile(io, pkgbuild_path, content, false);
+        try runFixtureCommand(allocator, io, &.{ "git", "add", "PKGBUILD" }, remote);
+        try runFixtureCommand(allocator, io, &.{ "git", "commit", "--allow-empty", "-m", "needed fixture" }, remote);
+        // The newest commit deliberately differs from the selected historical
+        // commit, so checking HEAD/RPC instead would fail the exact-equal case.
+        if (case.exact) {
+            const latest = try std.fmt.allocPrint(allocator, "pkgname={s}\npkgver=2\npkgrel=1\narch=('any')\npackage() {{ :; }}\n", .{case.name});
+            defer allocator.free(latest);
+            try writeFixtureFile(io, pkgbuild_path, latest, false);
+            try runFixtureCommand(allocator, io, &.{ "git", "add", "PKGBUILD" }, remote);
+            try runFixtureCommand(allocator, io, &.{ "git", "commit", "-m", "new version" }, remote);
+        }
+        const marker = try std.fs.path.join(allocator, &.{ fixture.root, "built" });
+        defer allocator.free(marker);
+        const makepkg = try std.fs.path.join(allocator, &.{ fixture.root, "makepkg" });
+        defer allocator.free(makepkg);
+        const script = if (case.archive)
+            try std.fmt.allocPrint(allocator,
+                \\#!/bin/sh
+                \\set -eu
+                \\printf x >> '{s}'
+                \\printf 'pkgname = {s}\npkgver = 1-1\npkgdesc = needed fixture\nbuilddate = 1700000000\npackager = Shelly Tests\nsize = 0\narch = any\n' > .PKGINFO
+                \\tar -czf '{s}-1-1-any.pkg.tar.gz' .PKGINFO
+                \\rm .PKGINFO
+                \\
+            , .{ marker, case.name, case.name })
+        else
+            try std.fmt.allocPrint(allocator, "#!/bin/sh\nprintf x >> '{s}'\nexit 1\n", .{marker});
+        defer allocator.free(script);
+        try writeFixtureFile(io, makepkg, script, true);
+        var manager = try Manager.init(allocator, fixture.environ, .{
+            .config_path = fixture.config_path,
+            .cache_root = fixture.cache_root,
+            .aur_git_base_url = fixture.remote_root,
+            .makepkg_command = makepkg,
+            .needed = case.needed,
+        });
+        defer manager.deinit();
+        manager.alpm.disable_transaction_hooks();
+        if (case.exact or case.dependencies_only) {
+            // These installation modes sync repositories. Register an inert local
+            // entry so this fixture never needs a network repository.
+            const raw = alpm_bindings.libalpm.alpm;
+            const database = raw.alpm_register_syncdb(manager.alpm.handle, "needed-fixture", 0) orelse return error.InitFailed;
+            try std.testing.expectEqual(@as(c_int, 0), raw.alpm_db_set_usage(database, 0));
+        }
+        var service = rpc.TestService{ .packages = &.{ .{ .Name = case.name, .PackageBase = case.name }, .{ .Name = "needed-dep", .PackageBase = "needed-dep" } } };
+        service.install(&manager.aur_client);
+        var context = operation_api.OperationContext.init(allocator, io);
+        defer context.deinit();
+        const Capture = struct {
+            skips: usize = 0,
+            alpm_confirmations: usize = 0,
+            fn answer(data: ?*anyopaque, question: operation_api.Question) operation_api.QuestionResponse {
+                const self: *@This() = @ptrCast(@alignCast(data.?));
+                if (question.kind == .confirm_transaction and question.envelope.backend == .alpm) {
+                    self.alpm_confirmations += 1;
+                    return .declined;
+                }
+                return .accepted;
+            }
+            fn info(data: ?*anyopaque, args: events.InformationalArgs) void {
+                const self: *@This() = @ptrCast(@alignCast(data.?));
+                if (std.mem.indexOf(u8, args.message, "already installed (--needed)") != null) self.skips += 1;
+            }
+        };
+        var capture: Capture = .{};
+        context.setQuestionHandler(.{ .function = Capture.answer, .data = &capture });
+        manager.setOperationContext(&context);
+        defer manager.setOperationContext(null);
+        _ = try manager.dispatcher.addInformationalHandler(.{ .function = Capture.info, .data = &capture });
+        const result = if (case.dependencies_only)
+            manager.installDependenciesOnly(case.name, true)
+        else if (case.exact)
+            manager.installPackageVersion(case.name, "HEAD~1")
+        else
+            manager.installPackages(&.{case.name});
+        if (case.skip) {
+            try result;
+            try std.testing.expectEqual(@as(usize, 1), capture.skips);
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, marker, .{}));
+        } else if (case.archive) {
+            try result;
+            try std.testing.expectEqual(@as(usize, 0), capture.skips);
+            try std.testing.expectEqual(@as(usize, 0), capture.alpm_confirmations);
+            try std.Io.Dir.cwd().access(io, marker, .{});
+        } else {
+            try std.testing.expectError(error.BuildFailed, result);
+            try std.testing.expectEqual(@as(usize, 0), capture.skips);
+            try std.Io.Dir.cwd().access(io, marker, .{});
+        }
+    }
+}
+
+test "AUR needed filters split members and mixed targets independently" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try createAurManagerFixturePaths(allocator, io);
+    defer fixture.deinit(allocator);
+    try seedNeededInstalledPackage(allocator, io, fixture.root, "needed-suite", "1-1");
+    try createSplitAurFixtureRepository(allocator, io, fixture.remote_root, "needed-suite", &.{ "needed-suite", "needed-docs" });
+    try createAurFixtureRepository(allocator, io, fixture.remote_root, "needed-other", null);
+    const makepkg = try std.fs.path.join(allocator, &.{ fixture.root, "makepkg" });
+    defer allocator.free(makepkg);
+    try writeFixtureFile(io, makepkg, "#!/bin/sh\nexit 1\n", true);
+    var manager = try Manager.init(allocator, fixture.environ, .{
+        .config_path = fixture.config_path,
+        .cache_root = fixture.cache_root,
+        .aur_git_base_url = fixture.remote_root,
+        .makepkg_command = makepkg,
+        .needed = true,
+    });
+    defer manager.deinit();
+    var service = rpc.TestService{ .packages = &.{
+        .{ .Name = "needed-suite", .PackageBase = "needed-suite" },
+        .{ .Name = "needed-docs", .PackageBase = "needed-suite" },
+        .{ .Name = "needed-other", .PackageBase = "needed-other" },
+    } };
+    service.install(&manager.aur_client);
+    const Approval = struct {
+        fn answer(_: ?*anyopaque, _: PkgbuildDiffRequest) bool {
+            return true;
+        }
+    };
+    manager.setPkgbuildApprovalHandler(.{ .function = Approval.answer, .data = null });
+    var failures: std.ArrayList(Manager.PackageFailure) = .empty;
+    defer {
+        for (failures.items) |failure| failure.deinit(allocator);
+        failures.deinit(allocator);
+    }
+    var plans = try manager.prepareInstallPlans(&.{ "needed-suite", "needed-docs", "needed-suite", "needed-other" }, &failures);
+    defer {
+        for (plans.items) |*plan| plan.deinit(allocator);
+        plans.deinit(allocator);
+    }
+    try manager.reviewInstallPlans(&plans);
+    try std.testing.expectEqual(@as(usize, 0), failures.items.len);
+    try std.testing.expectEqual(@as(usize, 2), plans.items.len);
+    try std.testing.expectEqual(@as(usize, 1), plans.items[0].requested_names.items.len);
+    try std.testing.expectEqualStrings("needed-docs", plans.items[0].requested_names.items[0]);
+    try std.testing.expectEqualStrings("needed-other", plans.items[1].requested_names.items[0]);
 }
 
 test "AUR upgrades skip declined reviews and continue independent packages" {

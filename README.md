@@ -254,7 +254,21 @@ shelly -Is --needed zed git -n
 
 This also applies to local Arch package archives. URL archives are downloaded
 before their package metadata can be checked. Without `--needed`, reinstall
-behavior is unchanged; AUR builds and Shelly binary archives are unaffected.
+behavior is unchanged; Shelly binary archives are unaffected.
+
+For AUR installs, `--needed` skips building and reinstalling packages with the
+same installed version, including individual members of split packages:
+
+```bash
+shelly -Ia --needed yay
+shelly install aur yay --needed -n
+```
+
+Shelly fetches and reviews the PKGBUILD before checking its generated package
+metadata. Dynamic versions and VCS packages may still require a build; the
+resulting archives also use `--needed` when installed. With `--version`, the
+comparison uses the selected Git commit. Dependency-only installs still check
+the requested dependencies even when the parent package is already installed.
 
 Build a PKGBUILD and install the resulting packages in one command, including
 any missing build dependencies:
