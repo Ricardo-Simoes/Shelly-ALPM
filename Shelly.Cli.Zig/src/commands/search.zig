@@ -126,6 +126,7 @@ const AurResult = struct {
     standard_packages: []const StandardPackage = &.{},
     pkgbuilds: ?[]const PackageBuild = null,
     detail: ?AurPackage = null,
+    aur_base: []const u8 = "",
 };
 
 const FlatpakResult = struct {
@@ -492,6 +493,7 @@ fn runAur(
     return .{
         .packages = packages,
         .standard_packages = try standard_packages.toOwnedSlice(context.allocator),
+        .aur_base = try context.allocator.dupe(u8, aur_base),
     };
 }
 
@@ -707,8 +709,18 @@ fn renderAur(
     var index: usize = 0;
     while (index < result.packages.len and rows.items.len < display_count) : (index += 1) {
         const package = result.packages[index];
+        var name_cell: []const u8 = package.name;
+        if (std.mem.indexOf(u8, result.aur_base, "atoll") != null) {
+            const hyper_path = std.mem.concat(context.allocator, u8, &.{ "/package/", package.name, "/" }) catch continue;
+            defer context.allocator.free(hyper_path);
+            name_cell = hyperlink(context.allocator, result.aur_base, hyper_path, package.name, context);
+        } else if (std.mem.indexOf(u8, result.aur_base, "aur.archlinux") != null) {
+            const hyper_path = std.mem.concat(context.allocator, u8, &.{ "/packages/", package.name, "/" }) catch continue;
+            defer context.allocator.free(hyper_path);
+            name_cell = hyperlink(context.allocator, result.aur_base, hyper_path, package.name, context);
+        }
         try rows.append(context.allocator, try row(context.allocator, &.{
-            package.name,
+            name_cell,
             package.version,
             package.maintainer orelse "Unknown Maintainer",
             try formatDateTime(context.allocator, package.last_modified),
@@ -1256,6 +1268,22 @@ fn row(allocator: std.mem.Allocator, values: []const []const u8) ![]const []cons
     return allocator.dupe([]const u8, values);
 }
 
+fn hyperlink(
+    allocator: std.mem.Allocator,
+    aur_base: []const u8,
+    url_path: []const u8,
+    text: []const u8,
+    context: *runtime.RuntimeContext,
+) []const u8 {
+    if (!output.supportsAnsi(context)) return text;
+
+    const url = std.mem.concat(allocator, u8, &.{ aur_base, url_path }) catch return text;
+    defer allocator.free(url);
+
+    const parts = [_][]const u8{ "\x1b]8;;", url, "\x1b\\", text, "\x1b]8;;\x1b\\" };
+    return std.mem.concat(allocator, u8, &parts) catch text;
+}
+
 test "search routes all action-first types through one handler" {
     var tc: test_support.TestContext = .{};
     tc.init();
@@ -1568,4 +1596,31 @@ test "package scoring matches the C# ranking tiers" {
     try std.testing.expectEqual(@as(u16, 200), packageScore("vesktop", "Discord client", "discord"));
     try std.testing.expectEqual(@as(u16, 150), packageScore("vesktop", "A custom discord client", "discord"));
     try std.testing.expectEqual(@as(u16, 100), packageScore("webcord", "A discordlike app", "discord"));
+}
+
+test "hyperlink builds correct OSC 8 links for atoll and aur" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environment = std.process.Environ.Map.init(allocator);
+    var stdout = std.Io.Writer.Discarding.init(&.{});
+    var stderr = std.Io.Writer.Discarding.init(&.{});
+    var context: runtime.RuntimeContext = .{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .stdout = &stdout.writer,
+        .stderr = &stderr.writer,
+        .stdin_is_tty = true,
+        .stdout_is_tty = true,
+        .environment = &environment,
+    };
+
+    const atoll = hyperlink(allocator, "https://atoll.seafoam-labs.org", "/package/vim/", "vim", &context);
+    try std.testing.expect(std.mem.indexOf(u8, atoll, "\x1b]8;;https://atoll.seafoam-labs.org/package/vim/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, atoll, "\x1b\\vim\x1b]8;;\x1b\\") != null);
+
+    const aur = hyperlink(allocator, "https://aur.archlinux.org", "/packages/vim/", "vim", &context);
+    try std.testing.expect(std.mem.indexOf(u8, aur, "\x1b]8;;https://aur.archlinux.org/packages/vim/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aur, "\x1b\\vim\x1b]8;;\x1b\\") != null);
 }
