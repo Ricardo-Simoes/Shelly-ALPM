@@ -393,6 +393,20 @@ pub const PackageBuilder = struct {
         operation: *op_context.Operation,
         writer: *std.Io.Writer,
     ) !void {
+        errdefer |err| {
+            // Step failures already publish their command and exit status.
+            // Publish early metadata errors too, so session logs retain them.
+            if (err != error.Cancelled and err != error.StepFailed) {
+                const message = @import("../../shared/user_errors.zig").format(self.allocator, err, .{
+                    .operation = ".SRCINFO generation",
+                    .subject = if (self.requested_names.len > 0) self.requested_names[0] else null,
+                }) catch null;
+                if (message) |detail| {
+                    defer self.allocator.free(detail);
+                    operation.reportError(err, detail, "metadata", null, false);
+                }
+            }
+        }
         const reviewed_digest = self.options.reviewed_pkgbuild_digest orelse
             return error.UnreviewedBuilderRequest;
         const pkgbuild_path = self.options.pkgbuild_path orelse
@@ -480,7 +494,7 @@ pub const PackageBuilder = struct {
         // just statically recognizable assignments) is reflected in the
         // execution plan. Path-less unit fixtures retain their lightweight
         // static-only behavior.
-        if (self.options.pkgbuild_path != null and self.package_builds[0].execution != null) {
+        if (self.options.pkgbuild_path != null) {
             var evaluated = try self.resolveEvaluatedBuilds(operation);
             defer evaluated.deinit(self.allocator);
             const pkgbuild_path = self.options.pkgbuild_path orelse
@@ -533,9 +547,7 @@ pub const PackageBuilder = struct {
         }
         try self.validatePackageFunctions();
         if (!self.options.sources_prepared) try sources.prepareSources(self, operation);
-        const shared_execution = self.package_builds[0].execution orelse
-            return error.MissingExecutionSteps;
-        for (shared_execution.steps) |step| {
+        if (self.package_builds[0].execution) |shared_execution| for (shared_execution.steps) |step| {
             if (steps.isPackageStep(step.name)) continue;
             if (std.mem.eql(u8, step.name, "check") and !self.options.run_check) continue;
             try steps.runStep(
@@ -548,7 +560,7 @@ pub const PackageBuilder = struct {
                 step.body,
                 null,
             );
-        }
+        };
 
         var artifacts: std.ArrayList(BuildArtifact) = .empty;
         errdefer {
@@ -572,23 +584,31 @@ pub const PackageBuilder = struct {
             else
                 null;
             defer if (approved_changelog) |value| self.allocator.free(value);
-            const package_execution = package_build.execution orelse
-                return error.MissingExecutionSteps;
-            const package_step = steps.findPackageStep(package_execution.steps) orelse
+            const package_step = if (package_build.execution) |execution|
+                steps.findPackageStep(execution.steps)
+            else
+                null;
+            if (package_step == null and
+                (package_build.has_generic_package_function or package_build.has_selected_package_function))
                 return error.MissingPackageStep;
             const artifact = artifact: {
                 self.clearVirtualOwnership();
                 defer self.clearVirtualOwnership();
-                try steps.runStep(
-                    self,
-                    operation,
-                    requested_name,
-                    package_step.name,
-                    package_execution.package_prelude,
-                    package_execution.package_helpers,
-                    package_step.body,
-                    null,
-                );
+                // Valid single-package PKGBUILDs may have no package function.
+                // They still produce an archive containing package metadata.
+                if (package_step) |step| {
+                    const execution = package_build.execution.?;
+                    try steps.runStep(
+                        self,
+                        operation,
+                        requested_name,
+                        step.name,
+                        execution.package_prelude,
+                        execution.package_helpers,
+                        step.body,
+                        null,
+                    );
+                }
                 if (!metadata.reviewedAuxiliarySelectionMatches(approved_install, package_build.install_file) or
                     !metadata.reviewedAuxiliarySelectionMatches(approved_changelog, package_build.changelog_file))
                     return error.ReviewedPkgbuildChanged;
