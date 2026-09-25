@@ -197,7 +197,13 @@ pub fn collectVersionUpdates(
     for (aur_packages) |package| {
         for (installed) |local| {
             if (!std.mem.eql(u8, package.name, local.name)) continue;
-            if (!(try version.isNewer(allocator, package.version, local.version))) break;
+            const remote_version = try allocator.dupeZ(u8, package.version);
+            defer allocator.free(remote_version);
+            const local_version = try allocator.dupeZ(u8, local.version);
+            defer allocator.free(local_version);
+            // Match pacman, including versions with an empty epoch emitted by
+            // older native builders, so equal versions do not trigger rebuilds.
+            if (AlpmManager.compare_package_versions(remote_version, local_version) <= 0) break;
             try updates.append(allocator, try models.Update.init(
                 allocator,
                 package.name,
@@ -4453,6 +4459,35 @@ test "AUR update projection compares remote and installed versions" {
     try std.testing.expectEqualStrings("newer", updates[0].name);
     try std.testing.expectEqualStrings("1.0-1", updates[0].version);
     try std.testing.expectEqualStrings("2.0-1", updates[0].new_version);
+}
+
+test "AUR update projection compares remote and installed versions using libalpm epoch semantics" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{"version":5,"type":"info","resultcount":1,"results":[
+        \\{"Name":"epoch-fixture","PackageBase":"epoch-fixture","Version":"4.1.13.9-1"}
+        \\]}
+    ;
+    var response = try models.Response.parse(allocator, payload);
+    defer response.deinit(allocator);
+    const cases = [_]struct { installed: []const u8, needs_update: bool }{
+        .{ .installed = ":4.1.13.9-1", .needs_update = false },
+        .{ .installed = "0:4.1.13.9-1", .needs_update = false },
+        .{ .installed = ":4.1.13.9-2", .needs_update = false },
+        .{ .installed = ":4.1.13.8-1", .needs_update = true },
+        .{ .installed = "1:4.1.13.8-1", .needs_update = false },
+    };
+    for (cases) |case| {
+        const updates = try collectVersionUpdates(allocator, &.{
+            .{ .name = "epoch-fixture", .version = case.installed, .explicit = true },
+        }, response.results);
+        defer models.Update.deinitSlice(allocator, updates);
+        try std.testing.expectEqual(@as(usize, if (case.needs_update) 1 else 0), updates.len);
+        if (case.needs_update) {
+            try std.testing.expectEqualStrings(case.installed, updates[0].version);
+            try std.testing.expectEqualStrings("4.1.13.9-1", updates[0].new_version);
+        }
+    }
 }
 
 test "AUR git remote and VCS suffix parsing mirror the C# manager" {
