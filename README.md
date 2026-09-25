@@ -243,6 +243,22 @@ CLI provides the same core functionality as the UI but in a scriptable, terminal
 
 Full documentation can be viewed on the [Shelly CLI Reference](https://www.seafoam-labs.org/shelly-alpm/docs/cli-reference/) page.
 
+Standard searches show available repository packages by default, with ranked
+matches for a query or a paginated listing when no query is supplied:
+
+```bash
+shelly search standard firefox
+shelly -Ss firefox
+shelly search standard
+shelly -Ss
+```
+
+Use `--detail`, `--info`, or `-d` to show metadata for one exact package name
+(for example, `shelly -Ss --detail firefox`). Use `--installed` to search
+installed ALPM packages or `--local` for Shelly-managed binary packages.
+`--explicit` and `--depends` select installed packages when no source is given.
+`--available` remains supported as an explicit repository source selector.
+
 Use `--needed` with standard installs to skip same-version reinstalls while still
 installing missing packages and allowing upgrades. The flag works before or after
 package names, and `-n` remains the separate no-confirm option:
