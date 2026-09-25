@@ -1,6 +1,31 @@
 const std = @import("std");
 const package_manifest = @import("build.zig.zon");
 
+// The pinned zig-toml parser requires a key even in {}. Patch its generated
+// source copy until the dependency supports empty inline tables (build.env = {}).
+// Never modify the dependency cache shared by other projects.
+fn patchedTomlModule(b: *std.Build, dependency: *std.Build.Dependency, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const source_path = dependency.path("src/table.zig").getPath3(b, null);
+    const source = source_path.root_dir.handle.readFileAlloc(b.graph.io, source_path.subPathOrDot(), b.allocator, .limited(1024 * 1024)) catch @panic("cannot read zig-toml table parser");
+    const before = "    while (true) {\n        spaces.skipSpacesAndLineBreaks(ctx);\n        var pair = try kv.parse(ctx);";
+    const after =
+        \\    spaces.skipSpacesAndLineBreaks(ctx);
+        \\    if (ctx.current() == '}') {
+        \\        _ = ctx.next();
+        \\        return table;
+        \\    }
+        \\    while (true) {
+        \\        spaces.skipSpacesAndLineBreaks(ctx);
+        \\        var pair = try kv.parse(ctx);
+    ;
+    if (std.mem.count(u8, source, before) != 1) @panic("zig-toml changed: review the empty inline table patch");
+    const patched = std.mem.replaceOwned(u8, b.allocator, source, before, after) catch @panic("OOM");
+    const files = b.addWriteFiles();
+    const directory = files.addCopyDirectory(dependency.path("src"), "src", .{ .exclude_extensions = &.{"table.zig"} });
+    _ = files.add("src/table.zig", patched);
+    return b.createModule(.{ .root_source_file = directory.path(b, "root.zig"), .target = target, .optimize = optimize });
+}
+
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
 // executed by an external runner. The functions in `std.Build` implement a DSL
@@ -26,6 +51,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const toml_module = patchedTomlModule(b, toml, target, optimize);
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -93,7 +119,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("operation_context", operation_context_mod);
     mod.addImport("user_account", user_account_mod);
     mod.addImport("ShellyHttp", shelly_http.module("ShellyHttp"));
-    mod.addImport("toml", toml.module("toml"));
+    mod.addImport("toml", toml_module);
     const package_options = b.addOptions();
     package_options.addOption([]const u8, "version", package_manifest.version);
     // Keep this generated module distinct from consumers that independently
@@ -299,7 +325,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     shellybuild_test_module.addImport("diagnostics", diagnostics);
-    shellybuild_test_module.addImport("toml", toml.module("toml"));
+    shellybuild_test_module.addImport("toml", toml_module);
     shellybuild_test_module.addImport("operation_context", operation_context_mod);
     shellybuild_test_module.addImport("user_account", user_account_mod);
     const shellybuild_tests = b.addTest(.{
@@ -851,6 +877,7 @@ pub fn build(b: *std.Build) void {
             "build environment exports flags hosts and compiler wrapper paths",
             "native build PATH",
             "PackageBuilder uses configured PATH",
+            "PackageBuilder build.env",
             "PackageBuilder reports invalid configured PATH",
             "disabled build environment removes inherited flags and hosts",
             "streaming process execution forwards stdout stderr and a final unterminated line",

@@ -2556,6 +2556,113 @@ test "PackageBuilder uses configured PATH for metadata SRCINFO and lifecycle ste
     try testing.expect(std.mem.indexOf(u8, fixture.builder.environ.getPosix("PATH").?, blocked_path) == null);
 }
 
+test "PackageBuilder build.env reaches metadata SRCINFO and lifecycle steps" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    const content =
+        \\pkgname=explicit-env-demo
+        \\pkgver=1
+        \\pkgrel=1
+        \\arch=('any')
+        \\pkgdesc="$JAVA_HOME"
+        \\options=('!buildflags' '!makeflags' '!lto')
+        \\prepare() { printf '%s\n' "$JAVA_HOME" > "$startdir/phases"; }
+        \\build() {
+        \\  [[ "$BUILD_ENV_LITERAL" = '$HOME/~/$(touch should-not-run); "quoted"' ]]
+        \\  [[ ${BUILD_ENV_EMPTY+x} = x && -z $BUILD_ENV_EMPTY ]]
+        \\  [[ ! ${CFLAGS+x} && ! ${MAKEFLAGS+x} && ! ${LTOFLAGS+x} ]]
+        \\  character='∂'
+        \\  [[ ${#character} = 1 ]]
+        \\  printf '%s\n' "$JAVA_HOME" >> "$startdir/phases"
+        \\}
+        \\check() { printf '%s\n' "$JAVA_HOME" >> "$startdir/phases"; }
+        \\package() {
+        \\  printf '%s\n' "$JAVA_HOME" >> "$startdir/phases"
+        \\  mkdir -p "$pkgdir/usr/share/explicit-env-demo"
+        \\  cp "$startdir/phases" "$pkgdir/usr/share/explicit-env-demo/phases"
+        \\}
+    ;
+    for ([_]bool{ false, true }) |clean_child| {
+        var fixture = try Fixture.create(allocator, content, null, null);
+        defer fixture.destroy();
+        const configuration = try ShellyBuildConfiguration.initFromBuffers(allocator, null,
+            \\[build.env]
+            \\JAVA_HOME = '/opt/configured java'
+            \\BUILD_ENV_LITERAL = '$HOME/~/$(touch should-not-run); "quoted"'
+            \\BUILD_ENV_EMPTY = ''
+            \\LANG = 'C'
+            \\LC_ALL = 'C.UTF-8'
+        );
+        defer configuration.deinit();
+        fixture.builder.shellybuild_config.build.env = configuration.build.env;
+        // Exercise both an inherited user environment and the minimal child
+        // environment used after the elevated coordinator drops privileges.
+        var environment = if (clean_child) std.process.Environ.Map.init(allocator) else try testing.environ.createMap(allocator);
+        defer environment.deinit();
+        try environment.put("PATH", "/usr/bin:/bin");
+        try environment.put("HOME", fixture.build_dir);
+        try environment.put("LANG", "C.UTF-8");
+        try environment.put("LC_ALL", "C");
+        if (!clean_child) try environment.put("JAVA_HOME", "/inherited/java");
+        const environ: std.process.Environ = .{ .block = try environment.createPosixBlock(allocator, .{}) };
+        defer environ.block.deinit(allocator);
+        fixture.builder.environ = environ;
+        try fixture.temporary.dir.writeFile(io, .{ .sub_path = "PKGBUILD", .data = content });
+        const path = try std.fs.path.join(allocator, &.{ fixture.build_dir, "PKGBUILD" });
+        defer allocator.free(path);
+        fixture.builder.options.pkgbuild_path = path;
+        var operation = fixture.operation_context.begin(.{ .backend = .aur, .kind = .build });
+        defer operation.finish(.success);
+        var review = try fixture.builder.prepareFinalReviewWithOperation(&operation);
+        defer review.deinit();
+        fixture.builder.options.reviewed_pkgbuild_digest = review.digest;
+        fixture.builder.options.reviewed_files = review.reviewed_files;
+        fixture.builder.options.install_scripts = review.install_scripts;
+        var srcinfo: std.Io.Writer.Allocating = .init(allocator);
+        defer srcinfo.deinit();
+        try fixture.builder.writeSrcinfoWithOperation(&operation, &srcinfo.writer);
+        try testing.expect(std.mem.indexOf(u8, srcinfo.written(), "pkgdesc = /opt/configured java") != null);
+        const artifacts = try fixture.builder.runWithOperation(&operation);
+        defer builder_mod.deinitArtifacts(allocator, artifacts);
+        const output = try readPackageEntry(allocator, artifacts[0].path, "usr/share/explicit-env-demo/phases");
+        defer allocator.free(output);
+        try testing.expectEqualStrings("/opt/configured java\n" ** 4, output);
+        try testing.expectEqualStrings("C.UTF-8", environ.getPosix("LANG").?);
+        try testing.expectEqualStrings("C", environ.getPosix("LC_ALL").?);
+        try testing.expectError(error.FileNotFound, fixture.temporary.dir.access(io, "src/should-not-run", .{}));
+    }
+}
+
+test "PackageBuilder build.env rejects reserved assignments before PKGBUILD execution" {
+    const allocator = testing.allocator;
+    const Capture = struct {
+        reported: bool = false,
+        fn handle(data: ?*anyopaque, event: op_context.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(data.?));
+            if (event == .failure and event.failure.err == error.ReservedBuildEnvironmentVariable) {
+                self.reported = std.mem.indexOf(u8, event.failure.message, "BASH_ENV") != null and
+                    std.mem.indexOf(u8, event.failure.message, "private-value") == null;
+            }
+        }
+    };
+    var capture: Capture = .{};
+    var fixture = try Fixture.create(allocator,
+        \\pkgname=env-rejected
+        \\pkgver=1
+        \\pkgrel=1
+        \\arch=('any')
+        \\package() { touch "$startdir/executed"; }
+    , .{ .function = Capture.handle, .data = &capture }, null);
+    defer fixture.destroy();
+    // Also validate programmatic configuration that bypasses the TOML parser.
+    fixture.builder.shellybuild_config.build.env = &.{.{ .name = "BASH_ENV", .value = "private-value" }};
+    var operation = fixture.operation_context.begin(.{ .backend = .aur, .kind = .build });
+    defer operation.finish(.failed);
+    try testing.expectError(error.ReservedBuildEnvironmentVariable, fixture.builder.runWithOperation(&operation));
+    try testing.expect(capture.reported);
+    try testing.expectError(error.FileNotFound, fixture.temporary.dir.access(testing.io, "executed", .{}));
+}
+
 test "PackageBuilder reports invalid configured PATH before executing PKGBUILD" {
     const Capture = struct {
         seen: bool = false,
@@ -6412,6 +6519,7 @@ test "PackageBuilder wraps lifecycle steps through the sandbox wrapper when enab
         \\arch=('any')
         \\
         \\build() {
+        \\  test "$BUILD_ENV_SANDBOX" = 'configured inside sandbox'
         \\  echo built > build-marker
         \\}
         \\package() {
@@ -6442,6 +6550,7 @@ test "PackageBuilder wraps lifecycle steps through the sandbox wrapper when enab
     var wrapper_prefix = [_][]const u8{stub_path};
 
     fixture.builder.shellybuild_config.sandbox.enabled = true;
+    fixture.builder.shellybuild_config.build.env = &.{.{ .name = "BUILD_ENV_SANDBOX", .value = "configured inside sandbox" }};
     fixture.builder.options.sandbox_wrapper_prefix = &wrapper_prefix;
 
     const artifacts = try fixture.builder.BuildPackage();
