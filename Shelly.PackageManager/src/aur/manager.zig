@@ -1046,7 +1046,7 @@ pub const Manager = struct {
         // Approve every requested PKGBUILD before sourcing any of them. Their
         // evaluated dependency trees are then fully reviewed before package
         // installation or build execution begins.
-        try self.reviewInstallPlans(&plans);
+        try self.reviewInstallPlans(&plans, &failures);
         if (plans.items.len > 0) try self.confirmInstallPlans(plans.items);
 
         for (plans.items, 0..) |*plan, index| {
@@ -1135,7 +1135,7 @@ pub const Manager = struct {
         return .{ .failures = try failures.toOwnedSlice(self.allocator) };
     }
 
-    fn reviewInstallPlans(self: *Self, plans: *std.ArrayList(PreparedInstall)) !void {
+    fn reviewInstallPlans(self: *Self, plans: *std.ArrayList(PreparedInstall), failures: *std.ArrayList(PackageFailure)) !void {
         var index: usize = 0;
         while (index < plans.items.len) {
             const plan = &plans.items[index];
@@ -1150,20 +1150,30 @@ pub const Manager = struct {
         index = 0;
         while (index < plans.items.len) {
             const plan = &plans.items[index];
-            try self.filterNeededTargets(plan);
+            self.prepareReviewedPlan(plan) catch |err| {
+                try self.checkCancelled();
+                if (err == error.PkgbuildReviewDeclined) {
+                    try self.skipDeclinedPlan(plan, err);
+                } else {
+                    for (plan.requested_names.items) |name|
+                        try self.recordPreparationFailure(failures, name, err);
+                }
+                var removed = plans.orderedRemove(index);
+                removed.deinit(self.allocator);
+                continue;
+            };
             if (plan.requested_names.items.len == 0) {
                 var removed = plans.orderedRemove(index);
                 removed.deinit(self.allocator);
                 continue;
             }
-            self.preparePlanDependencies(plan) catch |err| {
-                try self.skipDeclinedPlan(plan, err);
-                var removed = plans.orderedRemove(index);
-                removed.deinit(self.allocator);
-                continue;
-            };
             index += 1;
         }
+    }
+
+    fn prepareReviewedPlan(self: *Self, plan: *PreparedInstall) !void {
+        try self.filterNeededTargets(plan);
+        if (plan.requested_names.items.len > 0) try self.preparePlanDependencies(plan);
     }
 
     fn preparePlanDependencies(self: *Self, plan: *PreparedInstall) !void {
@@ -2340,7 +2350,29 @@ pub const Manager = struct {
             120,
         );
         defer result.deinit(self.allocator);
-        if (result.exit_code != 0) return error.BuildFailed;
+        return self.readSrcinfoCommandResult(prepared.package_name, &result);
+    }
+
+    fn readSrcinfoCommandResult(self: *Self, package_name: []const u8, result: *const builder.ProcessResult) ![]u8 {
+        if (result.exit_code != 0) {
+            const message = try std.fmt.allocPrint(
+                self.allocator,
+                "Could not generate .SRCINFO for {f} (exit code {d}).\n{s}{f}",
+                .{
+                    @import("diagnostics").safe(package_name),
+                    result.exit_code,
+                    if (result.stderr.len > 16 * 1024) "[earlier output omitted]\n" else "",
+                    @import("diagnostics").safe(result.stderr[result.stderr.len - @min(result.stderr.len, 16 * 1024) ..]),
+                },
+            );
+            defer self.allocator.free(message);
+            if (self.dispatcher.operation) |operation| {
+                operation.reportError(error.BuildFailed, message, "metadata", result.exit_code, false);
+            } else {
+                self.dispatcher.raiseError(.{ .message = message });
+            }
+            return error.BuildFailed;
+        }
         return self.allocator.dupe(u8, result.stdout);
     }
 
@@ -5317,12 +5349,150 @@ test "AUR needed filters split members and mixed targets independently" {
         for (plans.items) |*plan| plan.deinit(allocator);
         plans.deinit(allocator);
     }
-    try manager.reviewInstallPlans(&plans);
+    try manager.reviewInstallPlans(&plans, &failures);
     try std.testing.expectEqual(@as(usize, 0), failures.items.len);
     try std.testing.expectEqual(@as(usize, 2), plans.items.len);
     try std.testing.expectEqual(@as(usize, 1), plans.items[0].requested_names.items.len);
     try std.testing.expectEqualStrings("needed-docs", plans.items[0].requested_names.items[0]);
     try std.testing.expectEqualStrings("needed-other", plans.items[1].requested_names.items[0]);
+}
+
+test "AUR metadata child failures retain stderr and exit status" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try createAurManagerFixturePaths(allocator, io);
+    defer fixture.deinit(allocator);
+    var manager = try initFixtureAurManager(allocator, &fixture, fixture.remote_root);
+    defer manager.deinit();
+    var context = operation_api.OperationContext.init(allocator, io);
+    defer context.deinit();
+    manager.setOperationContext(&context);
+    defer manager.setOperationContext(null);
+    var scope = OperationScope.init(manager, .update, "unrelated-last-package");
+    scope.attach();
+    defer scope.finish(.failed);
+    const Capture = struct {
+        reported: bool = false,
+        fn handle(data: ?*anyopaque, event: operation_api.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(data.?));
+            switch (event) {
+                .failure => |failure| {
+                    self.reported = failure.err == error.BuildFailed and failure.native_code == 37 and
+                        std.mem.indexOf(u8, failure.message, "broken-meta") != null and
+                        std.mem.indexOf(u8, failure.message, "MissingPackageFunction") != null and
+                        std.mem.indexOf(u8, failure.message, "unrelated-last-package") == null;
+                },
+                else => {},
+            }
+        }
+    };
+    var capture: Capture = .{};
+    _ = try context.subscribe(.{ .function = Capture.handle, .data = &capture });
+    var result = try builder.run(allocator, io, &.{ "/bin/sh", "-c", "printf 'Technical details: MissingPackageFunction\\n' >&2; exit 37" }, fixture.root, 10);
+    defer result.deinit(allocator);
+    try std.testing.expectError(error.BuildFailed, manager.readSrcinfoCommandResult("broken-meta", &result));
+    try std.testing.expect(capture.reported);
+}
+
+test "AUR metadata failures name the package and continue independent metapackage upgrades" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |needed| {
+        var fixture = try createAurManagerFixturePaths(allocator, io);
+        defer fixture.deinit(allocator);
+        for ([_][]const u8{ "broken-meta", "needs-broken-meta", "good-meta" }) |name| {
+            try createAurFixtureRepository(allocator, io, fixture.remote_root, name, if (std.mem.eql(u8, name, "needs-broken-meta")) "broken-meta" else null);
+            if (std.mem.eql(u8, name, "needs-broken-meta")) continue;
+            const remote = try std.fmt.allocPrint(allocator, "{s}/{s}.git", .{ fixture.remote_root, name });
+            defer allocator.free(remote);
+            const path = try std.fs.path.join(allocator, &.{ remote, "PKGBUILD" });
+            defer allocator.free(path);
+            const content = try std.fmt.allocPrint(
+                allocator,
+                "pkgname={s}\npkgver=1\npkgrel=1\narch=('any')\n{s}",
+                .{ name, if (std.mem.eql(u8, name, "broken-meta")) "build() { :; }\n" else "" },
+            );
+            defer allocator.free(content);
+            try writeFixtureFile(io, path, content, false);
+            try runFixtureCommand(allocator, io, &.{ "git", "add", "PKGBUILD" }, remote);
+            try runFixtureCommand(allocator, io, &.{ "git", "commit", "-m", "metadata fixture" }, remote);
+        }
+        const makepkg = try std.fs.path.join(allocator, &.{ fixture.root, "makepkg" });
+        defer allocator.free(makepkg);
+        try writeFixtureFile(io, makepkg,
+            \\#!/bin/sh
+            \\set -eu
+            \\test "${PWD##*/}" = good-meta
+            \\printf 'pkgname = good-meta\npkgver = 1-1\npkgdesc = metapackage\nbuilddate = 1700000000\npackager = Shelly Tests\nsize = 0\narch = any\n' > .PKGINFO
+            \\tar -czf good-meta-1-1-any.pkg.tar.gz .PKGINFO
+            \\rm .PKGINFO
+            \\
+        , true);
+        var manager = try Manager.init(allocator, fixture.environ, .{
+            .config_path = fixture.config_path,
+            .cache_root = fixture.cache_root,
+            .aur_git_base_url = fixture.remote_root,
+            .makepkg_command = makepkg,
+            .needed = needed,
+        });
+        defer manager.deinit();
+        manager.alpm.disable_transaction_hooks();
+        var service = rpc.TestService{ .packages = &.{
+            .{ .Name = "broken-meta", .PackageBase = "broken-meta" },
+            .{ .Name = "needs-broken-meta", .PackageBase = "needs-broken-meta" },
+            .{ .Name = "good-meta", .PackageBase = "good-meta" },
+        } };
+        service.install(&manager.aur_client);
+        var context = operation_api.OperationContext.init(allocator, io);
+        defer context.deinit();
+        const Capture = struct {
+            metadata_failure: bool = false,
+            failed: usize = 0,
+            built: usize = 0,
+            completed: usize = 0,
+            completion: ?operation_api.CompletionStatus = null,
+            fn answer(_: ?*anyopaque, _: operation_api.Question) operation_api.QuestionResponse {
+                return .accepted;
+            }
+            fn handle(data: ?*anyopaque, event: operation_api.Event) void {
+                const self: *@This() = @ptrCast(@alignCast(data.?));
+                switch (event) {
+                    .failure => |failure| {
+                        if (std.mem.indexOf(u8, failure.message, "broken-meta") != null and
+                            std.mem.indexOf(u8, failure.message, "MissingPackageFunction") != null)
+                            self.metadata_failure = true;
+                    },
+                    .progress => |progress| {
+                        const stage = progress.update.stage orelse return;
+                        const name = progress.update.message orelse return;
+                        if (std.mem.eql(u8, stage, "aur_package_failed") and
+                            (std.mem.eql(u8, name, "broken-meta") or std.mem.eql(u8, name, "needs-broken-meta")))
+                            self.failed += 1;
+                        if (std.mem.eql(u8, stage, "aur_build_start")) self.built += 1;
+                        if (std.mem.eql(u8, stage, "aur_package_completed") and std.mem.eql(u8, name, "good-meta")) self.completed += 1;
+                    },
+                    .completed => |completion| {
+                        if (completion.envelope.parent_id == null and completion.envelope.backend == .aur)
+                            self.completion = completion.status;
+                    },
+                    else => {},
+                }
+            }
+        };
+        var capture: Capture = .{};
+        context.setQuestionHandler(.{ .function = Capture.answer });
+        _ = try context.subscribe(.{ .function = Capture.handle, .data = &capture });
+        manager.setOperationContext(&context);
+        defer manager.setOperationContext(null);
+        try std.testing.expectError(error.BuildFailed, manager.updatePackages(&.{ "broken-meta", "needs-broken-meta", "good-meta" }));
+        try std.testing.expect(capture.metadata_failure);
+        try std.testing.expectEqual(@as(usize, 2), capture.failed);
+        try std.testing.expectEqual(@as(usize, 1), capture.built);
+        try std.testing.expectEqual(@as(usize, 1), capture.completed);
+        try std.testing.expectEqual(operation_api.CompletionStatus.failed, capture.completion.?);
+        try std.testing.expect((try manager.alpm.get_single_installed_package("good-meta")) != null);
+        try std.testing.expect((try manager.alpm.get_single_installed_package("broken-meta")) == null);
+    }
 }
 
 test "AUR upgrades skip declined reviews and continue independent packages" {

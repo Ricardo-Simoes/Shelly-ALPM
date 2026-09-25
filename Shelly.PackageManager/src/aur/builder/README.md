@@ -23,7 +23,7 @@ PackageBuilder.runWithOperation (builder.zig)
      b. validate package-function shape      (builder.zig)
      c. acquire + verify + extract sources   (sources.zig)
      d. run prepare/pkgver/build/check steps (steps.zig)
-     e. per package: run package() step,
+     e. per package: run package() if present,
         assemble + sign the archive          (package_file.zig)
 ```
 
@@ -34,6 +34,12 @@ stages are delegated to sibling modules and passed the builder as
 operation/log. `writeSrcinfoWithOperation` shares the reviewed sandboxed
 metadata-evaluation stage, then serializes SRCINFO through `aur/srcinfo.zig`
 without acquiring sources or invoking lifecycle functions.
+
+Single-package PKGBUILDs without lifecycle functions are valid metapackages.
+They still undergo reviewed, sandboxed metadata evaluation and produce an
+archive containing package metadata and dependencies with an empty payload.
+As with makepkg, a `build()` function requires a package function, and split
+packages require a package function for every member.
 
 Each metadata evaluation sources the base PKGBUILD in a fresh Bash environment
 with the configured build flags and makepkg directory/architecture context.

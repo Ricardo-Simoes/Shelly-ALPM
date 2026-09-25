@@ -5236,23 +5236,23 @@ test "PackageBuilder reports failure when a step exits non-zero" {
     try testing.expectEqual(op_context.CompletionStatus.failed, capture.completion.?);
 }
 
-test "PackageBuilder reports failure instead of crashing without execution steps" {
+test "PackageBuilder builds a metapackage without execution steps" {
     const allocator = testing.allocator;
 
-    // A PKGBUILD that defines none of the well-known functions produces no
-    // execution steps; BuildPackage must report this gracefully instead of
-    // unwrapping a null optional.
+    // Path-less callers also support the parser's null execution plan.
+    var capture: CompletionCapture = .{};
     var fixture = try Fixture.create(allocator,
         \\pkgname=demo
         \\pkgver=1.0
+        \\pkgrel=1
         \\arch=('any')
-    , null, null);
+    , .{ .function = CompletionCapture.handle, .data = &capture }, null);
     defer fixture.destroy();
 
-    if (fixture.builder.BuildPackage()) |artifacts| {
-        builder_mod.deinitArtifacts(allocator, artifacts);
-        return error.ExpectedMissingSteps;
-    } else |_| {}
+    const artifacts = try fixture.builder.BuildPackage();
+    defer builder_mod.deinitArtifacts(allocator, artifacts);
+    try testing.expectEqual(@as(usize, 1), artifacts.len);
+    try testing.expectEqual(op_context.CompletionStatus.success, capture.completion.?);
 }
 
 test "PackageBuilder builds all requested split members after shared steps run once" {
@@ -5514,9 +5514,135 @@ test "PackageBuilder isolates unset metadata between split members" {
     try testing.expect(std.mem.indexOf(u8, reversed_one, "group = inherited-group\n") == null);
 }
 
+test "PackageBuilder functionless metapackages evaluate metadata and produce empty payload archives" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    for ([_][]const u8{
+        "pkgdesc='dependency metapackage'\ndepends=('bash' 'coreutils')\n",
+        "pkgdesc=$(printf 'dependency metapackage')\ndepends=('bash')\nif true; then depends+=('coreutils'); fi\n",
+        "describe() { printf 'dependency metapackage'; }\npkgdesc=$(describe)\ndepends=('bash' 'coreutils')\n",
+    }) |metadata_content| {
+        const content = try std.mem.concat(allocator, u8, &.{
+            "pkgname=test-meta\npkgver=1\npkgrel=1\narch=('any')\n",
+            metadata_content,
+        });
+        defer allocator.free(content);
+        for ([_]bool{ true, false }) |metadata_only| {
+            var fixture = try Fixture.create(allocator, content, null, null);
+            defer fixture.destroy();
+            try testing.expect(fixture.package_builds[0].execution == null);
+            try fixture.temporary.dir.writeFile(io, .{ .sub_path = "PKGBUILD", .data = content });
+            const path = try std.fs.path.join(allocator, &.{ fixture.build_dir, "PKGBUILD" });
+            defer allocator.free(path);
+            var review = try builder_mod.preparePkgbuildReview(allocator, io, fixture.build_dir, content, fixture.package_builds);
+            defer review.deinit();
+            fixture.builder.options.pkgbuild_path = path;
+            fixture.builder.options.reviewed_pkgbuild_digest = review.digest;
+            fixture.builder.options.sources_prepared = false;
+            fixture.builder.options.skip_source_pgp_verification = false;
+            fixture.builder.options.run_verify = true;
+
+            if (metadata_only) {
+                var srcinfo: std.Io.Writer.Allocating = .init(allocator);
+                defer srcinfo.deinit();
+                {
+                    var operation = fixture.operation_context.begin(.{ .backend = .aur, .kind = .build, .subject = "test-meta" });
+                    defer operation.finish(.success);
+                    try fixture.builder.writeSrcinfoWithOperation(&operation, &srcinfo.writer);
+                }
+                try testing.expectEqualStrings(
+                    "pkgbase = test-meta\n\tpkgdesc = dependency metapackage\n\tpkgver = 1\n\tpkgrel = 1\n" ++
+                        "\tarch = any\n\tdepends = bash\n\tdepends = coreutils\n\npkgname = test-meta\n",
+                    srcinfo.writer.buffered(),
+                );
+                continue;
+            }
+
+            const artifacts = try fixture.builder.BuildPackage();
+            defer builder_mod.deinitArtifacts(allocator, artifacts);
+            try testing.expectEqual(@as(usize, 1), artifacts.len);
+            const info = try readPkgInfo(allocator, artifacts[0].path);
+            defer allocator.free(info);
+            for ([_][]const u8{ "pkgname = test-meta\n", "pkgdesc = dependency metapackage\n", "depend = bash\n", "depend = coreutils\n", "size = 0\n" }) |expected|
+                try testing.expect(std.mem.indexOf(u8, info, expected) != null);
+
+            var reader = try archive.Reader.init(allocator, artifacts[0].path);
+            defer reader.deinit();
+            var entries: usize = 0;
+            while (try reader.next()) |entry| {
+                try testing.expect(std.mem.eql(u8, entry.path, ".PKGINFO") or
+                    std.mem.eql(u8, entry.path, ".BUILDINFO") or
+                    std.mem.eql(u8, entry.path, ".MTREE"));
+                entries += 1;
+            }
+            try testing.expectEqual(@as(usize, 3), entries);
+        }
+    }
+}
+
+test "PackageBuilder permits optional lifecycle steps without a package function" {
+    const allocator = testing.allocator;
+    var fixture = try Fixture.create(allocator,
+        \\pkgname=test-meta
+        \\pkgver=1
+        \\pkgrel=1
+        \\arch=('any')
+        \\prepare() { touch "$startdir/prepared"; }
+    , null, null);
+    defer fixture.destroy();
+    const artifacts = try fixture.builder.BuildPackage();
+    defer builder_mod.deinitArtifacts(allocator, artifacts);
+    try testing.expectEqual(@as(usize, 1), artifacts.len);
+    try fixture.temporary.dir.access(testing.io, "prepared", .{});
+}
+
+test "PackageBuilder SRCINFO failures publish package and underlying error" {
+    const allocator = testing.allocator;
+    const Capture = struct {
+        reported: bool = false,
+        fn handle(data: ?*anyopaque, event: op_context.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(data.?));
+            switch (event) {
+                .failure => |failure| {
+                    self.reported = failure.err == error.ReviewedPkgbuildChanged and
+                        std.mem.indexOf(u8, failure.message, "test-meta") != null and
+                        std.mem.indexOf(u8, failure.message, "ReviewedPkgbuildChanged") != null;
+                },
+                else => {},
+            }
+        }
+    };
+    var capture: Capture = .{};
+    const content = "pkgname=test-meta\npkgver=1\npkgrel=1\narch=('any')\n";
+    var fixture = try Fixture.create(allocator, content, .{ .function = Capture.handle, .data = &capture }, null);
+    defer fixture.destroy();
+    try fixture.temporary.dir.writeFile(testing.io, .{ .sub_path = "PKGBUILD", .data = content });
+    const path = try std.fs.path.join(allocator, &.{ fixture.build_dir, "PKGBUILD" });
+    defer allocator.free(path);
+    fixture.builder.options.pkgbuild_path = path;
+    // The fixture's zero digest deliberately does not match this PKGBUILD.
+    var operation = fixture.operation_context.begin(.{ .backend = .aur, .kind = .build, .subject = "test-meta" });
+    defer operation.finish(.failed);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try testing.expectError(error.ReviewedPkgbuildChanged, fixture.builder.writeSrcinfoWithOperation(&operation, &output.writer));
+    try testing.expect(capture.reported);
+    try testing.expectEqual(@as(usize, 0), output.writer.buffered().len);
+}
+
 test "PackageBuilder enforces makepkg package function contracts" {
     const allocator = testing.allocator;
     const requested = [_][]const u8{ "contract-one", "contract-two" };
+
+    var build_only = try Fixture.create(allocator,
+        \\pkgname=contract-one
+        \\pkgver=1
+        \\pkgrel=1
+        \\arch=('any')
+        \\build() { :; }
+    , null, null);
+    defer build_only.destroy();
+    try testing.expectError(error.BuildFailed, build_only.builder.BuildPackage());
 
     var generic_split = try Fixture.createMany(allocator,
         \\pkgname=('contract-one' 'contract-two')
