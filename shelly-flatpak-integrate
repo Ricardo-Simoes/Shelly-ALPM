@@ -94,4 +94,4 @@ if [[ $failed -gt 0 ]]; then
     printf 'Updated %d desktop entries; %d entries could not be updated. Successful changes were kept. Review the errors above.\n' "$updated" "$failed" >&2
     exit 1
 fi
-printf 'Flatpak desktop integration is ready (%d entries updated).\n' "$updated")
+printf 'Flatpak desktop integration is ready (%d entries updated).\n' "$updated"
