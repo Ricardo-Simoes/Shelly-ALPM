@@ -66,6 +66,7 @@ for dir in "${FLATPAK_DIRS[@]}"; do
 Name=Manage in Shelly
 Name[ru]=Управлять в Shelly
 Name[pl]=Zarządzaj w Shelly
+Name[pt]=Gerir no Shelly
 Icon=shelly
 Exec=/usr/bin/shelly-ui --page flatpak-install
 EOF
@@ -93,4 +94,4 @@ if [[ $failed -gt 0 ]]; then
     printf 'Updated %d desktop entries; %d entries could not be updated. Successful changes were kept. Review the errors above.\n' "$updated" "$failed" >&2
     exit 1
 fi
-printf 'Flatpak desktop integration is ready (%d entries updated).\n' "$updated"
+printf 'Flatpak desktop integration is ready (%d entries updated).\n' "$updated")
